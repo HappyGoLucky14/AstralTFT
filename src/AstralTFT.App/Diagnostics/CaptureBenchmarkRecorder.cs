@@ -98,7 +98,7 @@ internal sealed class CaptureBenchmarkRecorder
         var duration = endedAt - _startedAt;
 
         return new CaptureBenchmarkReport(
-            SchemaVersion: 1,
+            SchemaVersion: 2,
             AppVersion: Assembly.GetExecutingAssembly().GetName().Version?.ToString() ?? "dev",
             StartedAtUtc: _startedAt,
             EndedAtUtc: endedAt,

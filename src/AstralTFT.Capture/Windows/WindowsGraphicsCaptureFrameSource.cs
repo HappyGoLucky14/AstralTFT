@@ -16,8 +16,12 @@ public sealed record WgcCaptureTelemetry(
     long FramesDroppedByBackPressure,
     long ResizeEvents,
     long CaptureErrors,
+    long BytesReadBack,
     int Width,
     int Height,
+    string ReadbackRegionId,
+    int ReadbackWidth,
+    int ReadbackHeight,
     TimeSpan LastReadbackDuration);
 
 public enum WgcCaptureEndReason
@@ -66,6 +70,9 @@ public sealed class WindowsGraphicsCaptureFrameSource : IFrameSource
     private long _framesDroppedByBackPressure;
     private long _resizeEvents;
     private long _captureErrors;
+    private long _bytesReadBack;
+    private int _lastReadbackWidth;
+    private int _lastReadbackHeight;
     private long _lastReadbackTicks;
 
     public WindowsGraphicsCaptureFrameSource(GameWindow window, WgcCaptureOptions? options = null)
@@ -94,8 +101,12 @@ public sealed class WindowsGraphicsCaptureFrameSource : IFrameSource
         Interlocked.Read(ref _framesDroppedByBackPressure),
         Interlocked.Read(ref _resizeEvents),
         Interlocked.Read(ref _captureErrors),
+        Interlocked.Read(ref _bytesReadBack),
         _poolSize.Width,
         _poolSize.Height,
+        _options.CpuReadbackRegion?.Id ?? "full-frame",
+        Volatile.Read(ref _lastReadbackWidth),
+        Volatile.Read(ref _lastReadbackHeight),
         TimeSpan.FromTicks(Interlocked.Read(ref _lastReadbackTicks)));
 
     public ValueTask StartAsync(CancellationToken cancellationToken = default)
@@ -230,19 +241,26 @@ public sealed class WindowsGraphicsCaptureFrameSource : IFrameSource
 
                 var sw = Stopwatch.StartNew();
                 using var texture = Direct3DSurfaceInterop.GetTexture2D(frame.Surface);
-                var cpu = _readback!.Read(texture, size.Width, size.Height);
+                var sourceRegion = _options.CpuReadbackRegion?.Project(size.Width, size.Height);
+                var cpu = sourceRegion is { } region
+                    ? _readback!.ReadRegion(texture, region)
+                    : _readback!.Read(texture, size.Width, size.Height);
                 sw.Stop();
 
                 Interlocked.Exchange(ref _lastReadbackTicks, sw.Elapsed.Ticks);
                 Interlocked.Increment(ref _framesReadBack);
+                Interlocked.Add(ref _bytesReadBack, cpu.Buffer.RequiredByteLength);
+                Volatile.Write(ref _lastReadbackWidth, cpu.Buffer.Width);
+                Volatile.Write(ref _lastReadbackHeight, cpu.Buffer.Height);
 
                 var captured = new CapturedFrame(
                     Interlocked.Increment(ref _sequence),
                     DateTimeOffset.UtcNow,
-                    size.Width,
-                    size.Height,
+                    cpu.Buffer.Width,
+                    cpu.Buffer.Height,
                     cpu.Buffer,
-                    cpu.Lease);
+                    cpu.Lease,
+                    sourceRegion);
 
                 PublishLatest(captured);
             }

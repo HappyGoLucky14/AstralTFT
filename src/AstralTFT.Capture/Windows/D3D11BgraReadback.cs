@@ -3,15 +3,16 @@ using System.Runtime.InteropServices;
 using AstralTFT.Capture.Abstractions;
 using Vortice.Direct3D11;
 using Vortice.DXGI;
+using Vortice.Mathematics;
 
 namespace AstralTFT.Capture.Windows;
 
 internal sealed record CpuReadbackFrame(Bgra32FrameBuffer Buffer, IDisposable Lease);
 
 /// <summary>
-/// First benchmark path: one reusable staging texture plus pooled CPU byte arrays.
-/// Avoiding an ~8 MB managed allocation for every 1080p sample is essential; the
-/// later ROI-only/GPU fingerprint path can replace the full-frame copy entirely.
+/// Reusable staging-texture readback. Full-frame copy remains available as a baseline,
+/// but ReadRegion uses CopySubresourceRegion so only the requested pixels cross the
+/// GPU-to-CPU boundary. Pooled arrays avoid allocating a new pixel buffer per sample.
 /// </summary>
 internal sealed class D3D11BgraReadback : IDisposable
 {
@@ -30,12 +31,52 @@ internal sealed class D3D11BgraReadback : IDisposable
     public CpuReadbackFrame Read(ID3D11Texture2D source, int width, int height)
     {
         ArgumentNullException.ThrowIfNull(source);
-        if (width <= 0) throw new ArgumentOutOfRangeException(nameof(width));
-        if (height <= 0) throw new ArgumentOutOfRangeException(nameof(height));
+        ArgumentOutOfRangeException.ThrowIfNegativeOrZero(width);
+        ArgumentOutOfRangeException.ThrowIfNegativeOrZero(height);
 
         EnsureStaging(width, height);
         _context.CopyResource(_staging!, source);
+        return MapStaging(width, height);
+    }
 
+    public CpuReadbackFrame ReadRegion(ID3D11Texture2D source, RegionOfInterest region)
+    {
+        ArgumentNullException.ThrowIfNull(source);
+        ArgumentOutOfRangeException.ThrowIfNegative(region.X);
+        ArgumentOutOfRangeException.ThrowIfNegative(region.Y);
+        ArgumentOutOfRangeException.ThrowIfNegativeOrZero(region.Width);
+        ArgumentOutOfRangeException.ThrowIfNegativeOrZero(region.Height);
+
+        EnsureStaging(region.Width, region.Height);
+        var sourceBox = new Box(
+            region.X,
+            region.Y,
+            region.X + region.Width,
+            region.Y + region.Height);
+
+        _context.CopySubresourceRegion(
+            _staging!,
+            0,
+            0,
+            0,
+            0,
+            source,
+            0,
+            sourceBox);
+
+        return MapStaging(region.Width, region.Height);
+    }
+
+    public void Dispose()
+    {
+        _staging?.Dispose();
+        _staging = null;
+        _width = 0;
+        _height = 0;
+    }
+
+    private CpuReadbackFrame MapStaging(int width, int height)
+    {
         var mapped = _context.Map(_staging!, 0, MapMode.Read);
         byte[]? pixels = null;
         try
@@ -63,7 +104,7 @@ internal sealed class D3D11BgraReadback : IDisposable
                 height,
                 packedStride,
                 new ReadOnlyMemory<byte>(pixels, 0, required));
-            pixels = null; // lease owns it now
+            pixels = null;
             return new CpuReadbackFrame(buffer, lease);
         }
         finally
@@ -72,14 +113,6 @@ internal sealed class D3D11BgraReadback : IDisposable
             if (pixels is not null)
                 ArrayPool<byte>.Shared.Return(pixels);
         }
-    }
-
-    public void Dispose()
-    {
-        _staging?.Dispose();
-        _staging = null;
-        _width = 0;
-        _height = 0;
     }
 
     private void EnsureStaging(int width, int height)

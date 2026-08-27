@@ -12,7 +12,8 @@ public sealed record CapturedFrame(
     int Width,
     int Height,
     object NativeFrameHandle,
-    IDisposable? ResourceLease = null) : IDisposable
+    IDisposable? ResourceLease = null,
+    RegionOfInterest? SourceRegion = null) : IDisposable
 {
     public void Dispose() => ResourceLease?.Dispose();
 }

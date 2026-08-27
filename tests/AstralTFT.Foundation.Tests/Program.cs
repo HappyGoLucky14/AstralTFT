@@ -52,6 +52,7 @@ var tests = new (string Name, Action Run)[]
     ("Detector registry rejects ambiguous region ownership", DetectorRegistryRejectsDuplicates),
     ("Frame pump disposes capture lease after ROI routing", FramePumpDisposesCaptureLease),
     ("TFT window selector rejects guide/browser false positives", TftWindowSelectorRejectsFalsePositives),
+    ("Normalized WGC ROI projects deterministically", NormalizedWgcRoiProjectsDeterministically),
 };
 
 var failures = new List<string>();
@@ -638,44 +639,6 @@ static void True(bool value, string message)
 }
 
 
-static void TftWindowSelectorRejectsFalsePositives()
-{
-    var candidates = new[]
-    {
-        new TftWindowCandidateSelector.Candidate(
-            (nint)1,
-            "firefox",
-            "Blossom Comp Guide [Set 18] | TFT Flow â€” Mozilla Firefox",
-            1920,
-            1040,
-            false),
-
-        new TftWindowCandidateSelector.Candidate(
-            (nint)2,
-            "TFTAcademy",
-            "TFTAcademy",
-            1080,
-            1194,
-            false),
-
-        new TftWindowCandidateSelector.Candidate(
-            (nint)3,
-            "TFTClient-Win64-Shipping",
-            "TFT  ",
-            1920,
-            1080,
-            false)
-    };
-
-    Equal(0, TftWindowCandidateSelector.Score("firefox", "TFT Flow"));
-    Equal(0, TftWindowCandidateSelector.Score("TFTAcademy", "TFTAcademy"));
-
-    var selected = TftWindowCandidateSelector.ChooseBest(candidates);
-    True(selected is not null, "Expected the real TFT client to be selected.");
-    Equal((nint)3, selected!.Window.Hwnd);
-    Equal("TFTClient-Win64-Shipping", selected.Window.ProcessName);
-}
-
 sealed class TrackingDisposable : IDisposable
 {
     public bool IsDisposed { get; private set; }
@@ -734,6 +697,41 @@ sealed class TrackingSnapshot : IRegionSnapshot
     public int Height => 8;
     public bool IsDisposed { get; private set; }
     public void Dispose() => IsDisposed = true;
+}
+
+
+
+static void NormalizedWgcRoiProjectsDeterministically()
+{
+    var region = new WgcNormalizedRegion("shop", 0.20, 0.77, 0.60, 0.22);
+    var projected = region.Project(1920, 1080);
+
+    Equal("shop", projected.Id);
+    Equal(384, projected.X);
+    Equal(831, projected.Y);
+    Equal(1152, projected.Width);
+    Equal(239, projected.Height);
+}
+
+static void TftWindowSelectorRejectsFalsePositives()
+{
+    var candidates = new[]
+    {
+        new TftWindowCandidateSelector.Candidate(
+            (nint)1, "firefox", "Blossom Comp Guide [Set 18] | TFT Flow — Mozilla Firefox", 1920, 1040, false),
+        new TftWindowCandidateSelector.Candidate(
+            (nint)2, "TFTAcademy", "TFTAcademy", 1080, 1194, false),
+        new TftWindowCandidateSelector.Candidate(
+            (nint)3, "TFTClient-Win64-Shipping", "TFT  ", 1920, 1080, false)
+    };
+
+    Equal(0, TftWindowCandidateSelector.Score("firefox", "TFT Flow"));
+    Equal(0, TftWindowCandidateSelector.Score("TFTAcademy", "TFTAcademy"));
+
+    var selected = TftWindowCandidateSelector.ChooseBest(candidates);
+    True(selected is not null, "Expected the real TFT client to be selected.");
+    Equal((nint)3, selected!.Window.Hwnd);
+    Equal("TFTClient-Win64-Shipping", selected.Window.ProcessName);
 }
 
 sealed class FakeDetector : IRegionObservationDetector

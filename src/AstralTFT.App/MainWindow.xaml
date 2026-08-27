@@ -28,7 +28,7 @@
             <StackPanel>
                 <TextBlock Text="ASTRALTFT" FontSize="12" FontWeight="SemiBold" Foreground="{StaticResource AccentBrush}"/>
                 <TextBlock Text="Capture Diagnostics" FontSize="25" FontWeight="SemiBold" Margin="0,2,0,0"/>
-                <TextBlock Text="Windows Graphics Capture benchmark build" Foreground="{StaticResource MutedBrush}" Margin="0,4,0,0"/>
+                <TextBlock Text="Windows Graphics Capture ROI benchmark build" Foreground="{StaticResource MutedBrush}" Margin="0,4,0,0"/>
             </StackPanel>
             <Border Grid.Column="1" CornerRadius="999" Background="{StaticResource Panel2Brush}" Padding="10,6" VerticalAlignment="Top">
                 <StackPanel Orientation="Horizontal">
@@ -121,7 +121,7 @@
                     <Grid.ColumnDefinitions><ColumnDefinition Width="*"/><ColumnDefinition Width="Auto"/></Grid.ColumnDefinitions>
                     <StackPanel>
                         <TextBlock Text="WGC + D3D11 readback" FontWeight="SemiBold"/>
-                        <TextBlock Text="TFT-only capture, newest-frame queue, resize recovery" Foreground="{StaticResource MutedBrush}" FontSize="12" Margin="0,3,0,0"/>
+                        <TextBlock Text="TFT-only capture, ROI readback, newest-frame queue" Foreground="{StaticResource MutedBrush}" FontSize="12" Margin="0,3,0,0"/>
                     </StackPanel>
                     <TextBlock Grid.Column="1" Text="IMPLEMENTED" Foreground="{StaticResource GoodBrush}" VerticalAlignment="Center" FontWeight="SemiBold"/>
                 </Grid>

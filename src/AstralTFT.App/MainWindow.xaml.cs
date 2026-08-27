@@ -14,7 +14,13 @@ public partial class MainWindow : Window, INotifyPropertyChanged
         MaxCpuReadbacksPerSecond: 10,
         FramePoolBufferCount: 2,
         CaptureCursor: false,
-        AllowWarpFallback: false);
+        AllowWarpFallback: false,
+        CpuReadbackRegion: new WgcNormalizedRegion(
+            Id: "shop-band-benchmark",
+            X: 0.20,
+            Y: 0.77,
+            Width: 0.60,
+            Height: 0.22));
 
     private readonly TftWindowLocator _locator = new();
     private readonly CancellationTokenSource _shutdown = new();
@@ -227,12 +233,16 @@ public partial class MainWindow : Window, INotifyPropertyChanged
                 ? telemetry.FramesReadBack / elapsed.TotalSeconds
                 : 0;
 
+            var megabytesPerSecond = elapsed.TotalSeconds > 0.25
+                ? telemetry.BytesReadBack / elapsed.TotalSeconds / 1024d / 1024d
+                : 0;
+
             CaptureRateText = $"{readbackRate:F1} readbacks/s";
             ReadbackText = telemetry.LastReadbackDuration == TimeSpan.Zero
                 ? "warming up"
-                : $"{telemetry.LastReadbackDuration.TotalMilliseconds:F2} ms";
+                : $"{telemetry.LastReadbackDuration.TotalMilliseconds:F2} ms • {telemetry.ReadbackWidth}×{telemetry.ReadbackHeight}";
             DropText = $"{telemetry.FramesDroppedWhileBusy} busy • {telemetry.FramesDroppedByBackPressure} stale • {telemetry.FramesDroppedByThrottle} throttled";
-            CaptureDetails = $"Arrived {telemetry.FramesArrived:N0} • Read back {telemetry.FramesReadBack:N0} • Resizes {telemetry.ResizeEvents} • Errors {telemetry.CaptureErrors} • {telemetry.Width}×{telemetry.Height}";
+            CaptureDetails = $"ROI {telemetry.ReadbackRegionId} • {megabytesPerSecond:F1} MB/s CPU copy • Arrived {telemetry.FramesArrived:N0} • Read back {telemetry.FramesReadBack:N0} • Errors {telemetry.CaptureErrors} • source {telemetry.Width}×{telemetry.Height}";
 
             if (telemetry.CaptureErrors > 0)
             {
