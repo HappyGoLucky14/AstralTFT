@@ -45,6 +45,16 @@ public sealed record ShopRecognitionResult(
 public sealed class ShopSlotRecognizer
 {
     private readonly record struct NormalizedSlot(double X, double Y, double Width, double Height);
+    private readonly record struct FrameBandEvidence(
+        double ChromaticRatio,
+        double NeutralRatio,
+        double MeanLuma);
+
+    private const double ActiveTopBorderRatio = 0.28;
+    private const double ActiveSeparatorRatio = 0.18;
+    private const double HoldTopBorderRatio = 0.24;
+    private const double HoldSeparatorRatio = 0.14;
+    private const double MutedFrameMinimumContrast = 6;
 
     // Calibrated from a real 1920x1080 Set 18 frame. Reference readback ROI:
     // 1152x239 at full-frame x=.20, y=.77, w=.60, h=.22.
@@ -90,12 +100,13 @@ public sealed class ShopSlotRecognizer
         var regions = ProjectSlots(buffer.Width, buffer.Height);
         var pixels = buffer.Pixels.Span;
 
-        var topBorderMatches = 0;
+        var activeTopBorderMatches = 0;
+        var holdTopBorderMatches = 0;
         foreach (var region in regions)
         {
             var stripTop = Math.Clamp(region.Y - 2, 0, buffer.Height - 1);
             var stripBottom = Math.Clamp(region.Y + 5, stripTop + 1, buffer.Height);
-            var ratio = MeasureFramePixelRatio(
+            var evidence = MeasureFrameBandEvidence(
                 pixels,
                 buffer.Stride,
                 region.X,
@@ -103,11 +114,30 @@ public sealed class ShopSlotRecognizer
                 region.Width,
                 stripBottom - stripTop);
 
-            if (ratio >= 0.24)
-                topBorderMatches++;
+            var referenceTop = Math.Clamp(stripBottom + 2, 0, buffer.Height - 1);
+            var referenceBottom = Math.Clamp(referenceTop + 5, referenceTop + 1, buffer.Height);
+            var referenceLuma = MeasureMeanLuma(
+                pixels,
+                buffer.Stride,
+                region.X,
+                referenceTop,
+                region.Width,
+                referenceBottom - referenceTop);
+            var hasFrameContrast = HasFrameContrast(evidence.MeanLuma, referenceLuma);
+
+            if (hasFrameContrast && evidence.ChromaticRatio >= ActiveTopBorderRatio)
+                activeTopBorderMatches++;
+
+            if (hasFrameContrast &&
+                (evidence.ChromaticRatio >= HoldTopBorderRatio ||
+                 evidence.NeutralRatio >= HoldTopBorderRatio))
+            {
+                holdTopBorderMatches++;
+            }
         }
 
-        var separatorMatches = 0;
+        var activeSeparatorMatches = 0;
+        var holdSeparatorMatches = 0;
         for (var i = 0; i < regions.Count - 1; i++)
         {
             var left = regions[i];
@@ -123,7 +153,7 @@ public sealed class ShopSlotRecognizer
             if (stripBottom <= stripTop)
                 continue;
 
-            var ratio = MeasureFramePixelRatio(
+            var evidence = MeasureFrameBandEvidence(
                 pixels,
                 buffer.Stride,
                 gapLeft,
@@ -131,33 +161,57 @@ public sealed class ShopSlotRecognizer
                 gapRight - gapLeft,
                 stripBottom - stripTop);
 
-            if (ratio >= 0.14)
-                separatorMatches++;
+            var referenceWidth = Math.Min(4, Math.Min(left.Width, right.Width));
+            var leftReferenceLuma = MeasureMeanLuma(
+                pixels,
+                buffer.Stride,
+                gapLeft - referenceWidth,
+                stripTop,
+                referenceWidth,
+                stripBottom - stripTop);
+            var rightReferenceLuma = MeasureMeanLuma(
+                pixels,
+                buffer.Stride,
+                gapRight,
+                stripTop,
+                referenceWidth,
+                stripBottom - stripTop);
+            var referenceLuma = (leftReferenceLuma + rightReferenceLuma) / 2;
+            var hasFrameContrast = HasFrameContrast(evidence.MeanLuma, referenceLuma);
+
+            if (hasFrameContrast && evidence.ChromaticRatio >= ActiveSeparatorRatio)
+                activeSeparatorMatches++;
+
+            if (hasFrameContrast &&
+                (evidence.ChromaticRatio >= HoldSeparatorRatio ||
+                 evidence.NeutralRatio >= HoldSeparatorRatio))
+            {
+                holdSeparatorMatches++;
+            }
         }
 
-        var confidence =
-            (topBorderMatches / 5d) * 0.55 +
-            (separatorMatches / 4d) * 0.45;
+        var activeConfidence =
+            (activeTopBorderMatches / 5d) * 0.55 +
+            (activeSeparatorMatches / 4d) * 0.45;
 
         var isVisible =
-            topBorderMatches >= 4 &&
-            separatorMatches >= 3 &&
-            confidence >= 0.70;
+            activeTopBorderMatches >= 4 &&
+            activeSeparatorMatches >= 3;
 
         // Once a real shop has been confirmed, muted/greyed card states and short
         // round-transition effects are allowed to keep the HUD alive without
         // authorizing a fresh slot read. This is deliberately weaker than the
         // initial activation threshold and is only used as temporal hysteresis.
         var supportsHold =
-            (topBorderMatches >= 3 && separatorMatches >= 2 && confidence >= 0.50) ||
-            (topBorderMatches >= 4 && separatorMatches >= 1 && confidence >= 0.48);
+            (holdTopBorderMatches >= 3 && holdSeparatorMatches >= 2) ||
+            (holdTopBorderMatches >= 4 && holdSeparatorMatches >= 1);
 
         return new ShopHudObservation(
             IsVisible: isVisible,
             SupportsHold: supportsHold,
-            Confidence: confidence,
-            TopBorderMatches: topBorderMatches,
-            SeparatorMatches: separatorMatches);
+            Confidence: activeConfidence,
+            TopBorderMatches: activeTopBorderMatches,
+            SeparatorMatches: activeSeparatorMatches);
     }
 
     public ShopRecognitionResult Recognize(Bgra32FrameBuffer buffer)
@@ -185,7 +239,7 @@ public sealed class ShopSlotRecognizer
             ProcessingTime: System.Diagnostics.Stopwatch.GetElapsedTime(started));
     }
 
-    private static double MeasureFramePixelRatio(
+    private static FrameBandEvidence MeasureFrameBandEvidence(
         ReadOnlySpan<byte> pixels,
         int stride,
         int x,
@@ -194,10 +248,12 @@ public sealed class ShopSlotRecognizer
         int height)
     {
         if (width <= 0 || height <= 0)
-            return 0;
+            return default;
 
-        long matches = 0;
+        long chromaticMatches = 0;
+        long neutralMatches = 0;
         long count = 0;
+        double lumaSum = 0;
 
         for (var yy = y; yy < y + height; yy++)
         {
@@ -213,29 +269,70 @@ public sealed class ShopSlotRecognizer
                 var chroma = max - min;
                 var luma = r * 0.2126 + g * 0.7152 + b * 0.0722;
 
-                // Normal shop chrome is dark blue/cyan, but TFT can desaturate the
-                // entire shop when the player cannot afford a unit. Accept both the
-                // normal chromatic frame and its dark neutral/greyed equivalent.
+                // Only chromatic TFT shop chrome may activate recognition. Neutral
+                // pixels are weaker evidence reserved for temporal hold and require
+                // local contrast at the caller so flat scenery cannot match.
                 var darkCyanFrame =
-                    max <= 92 &&
-                    r <= 68 &&
-                    g >= r - 3 &&
-                    b >= r - 3 &&
-                    (g - r >= 1 || b - r >= 1);
+                    max <= 80 &&
+                    r <= 55 &&
+                    chroma >= 6 &&
+                    g >= r &&
+                    b >= r &&
+                    g - r >= 2 &&
+                    b - r >= 2;
 
                 var darkNeutralFrame =
-                    luma <= 72 &&
+                    luma is >= 16 and <= 72 &&
                     max <= 86 &&
                     chroma <= 22;
 
-                if (darkCyanFrame || darkNeutralFrame)
-                    matches++;
+                if (darkCyanFrame)
+                    chromaticMatches++;
+                if (darkNeutralFrame)
+                    neutralMatches++;
 
+                lumaSum += luma;
                 count++;
             }
         }
 
-        return count == 0 ? 0 : matches / (double)count;
+        return count == 0
+            ? default
+            : new FrameBandEvidence(
+                chromaticMatches / (double)count,
+                neutralMatches / (double)count,
+                lumaSum / count);
+    }
+
+    private static bool HasFrameContrast(double frameLuma, double referenceLuma)
+    {
+        return Math.Abs(frameLuma - referenceLuma) >= MutedFrameMinimumContrast;
+    }
+
+    private static double MeasureMeanLuma(
+        ReadOnlySpan<byte> pixels,
+        int stride,
+        int x,
+        int y,
+        int width,
+        int height)
+    {
+        if (width <= 0 || height <= 0)
+            return 0;
+
+        double sum = 0;
+        long count = 0;
+
+        for (var yy = y; yy < y + height; yy++)
+        {
+            for (var xx = x; xx < x + width; xx++)
+            {
+                sum += LumaAt(pixels, stride, xx, yy);
+                count++;
+            }
+        }
+
+        return count == 0 ? 0 : sum / count;
     }
 
     private static bool IsStructurallyKnown(ShopSlotReading slot)

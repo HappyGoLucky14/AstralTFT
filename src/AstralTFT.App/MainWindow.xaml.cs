@@ -324,7 +324,7 @@ public partial class MainWindow : Window, INotifyPropertyChanged
                                 RecognitionDetails =
                                     $"{_lastConfirmedShopSummary}  •  temporarily holding ({remaining} grace frames)";
                                 FooterText =
-                                    $"Shop chrome is muted/transitioning • anchors {hud.TopBorderMatches}/5 top, {hud.SeparatorMatches}/4 separators • no new shop guess is being made.";
+                                    "Shop chrome is muted/transitioning • hold-only frame evidence detected • no new shop guess is being made.";
                             });
                         }
                         else if (!_shopHudConfirmed)

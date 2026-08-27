@@ -59,6 +59,11 @@ var tests = new (string Name, Action Run)[]
     ("Shop HUD gate rejects incomplete false positives", ShopHudGateRejectsIncompleteFalsePositives),
     ("Shop HUD requires repeated frame anchors", ShopHudRequiresFrameAnchors),
     ("Shop HUD accepts greyed unaffordable chrome", ShopHudAcceptsGreyedChrome),
+    ("Shop HUD accepts low-luma greyed chrome", ShopHudAcceptsLowLumaGreyedChrome),
+    ("Shop HUD rejects uniform neutral scenery", ShopHudRejectsUniformNeutralScenery),
+    ("Shop HUD rejects uniform tinted scenery", ShopHudRejectsUniformTintedScenery),
+    ("Shop HUD rejects weak frame coverage", ShopHudRejectsWeakFrameCoverage),
+    ("Shop HUD accepts calibrated frame coverage", ShopHudAcceptsCalibratedFrameCoverage),
 };
 
 var failures = new List<string>();
@@ -882,6 +887,7 @@ static void ShopHudRequiresFrameAnchors()
     var hud = recognizer.CheckHud(buffer);
 
     True(!hud.IsVisible, "Five card-like regions without shop-frame anchors must stay inactive.");
+    True(!hud.SupportsHold, "Card-like regions without shop-frame anchors must not prolong a confirmed shop.");
 }
 
 static void PaintSyntheticShopHudFrame(
@@ -925,19 +931,79 @@ static void PaintSyntheticShopHudFrame(
     }
 }
 
-
-static void ShopHudAcceptsGreyedChrome()
+static void PaintShopHudAnchorCoverage(
+    byte[] pixels,
+    int stride,
+    IReadOnlyList<RegionOfInterest> slots,
+    double topBorderFraction,
+    double separatorFraction)
 {
-    const int width = 1152;
-    const int height = 239;
-    const int stride = width * 4;
-    var pixels = new byte[stride * height];
-    FillBgra(pixels, stride, 0, 0, width, height, 18, 18, 18);
+    foreach (var slot in slots)
+    {
+        PaintBgraFraction(
+            pixels,
+            stride,
+            slot.X,
+            Math.Max(0, slot.Y - 2),
+            slot.Width,
+            7,
+            topBorderFraction,
+            0,
+            60,
+            80);
+    }
 
-    var slots = ShopSlotRecognizer.ProjectSlots(width, height);
+    for (var i = 0; i < slots.Count - 1; i++)
+    {
+        var left = slots[i];
+        var right = slots[i + 1];
+        var gapX = left.X + left.Width;
+        var gapWidth = Math.Max(1, right.X - gapX);
+        var top = Math.Max(left.Y, right.Y) + 8;
+        var bottom = Math.Min(left.Y + left.Height, right.Y + right.Height) - 8;
 
-    // Draw the same repeated shop frame in a fully desaturated dark grey,
-    // modelling TFT's unaffordable/temporarily muted visual state.
+        PaintBgraFraction(
+            pixels,
+            stride,
+            gapX,
+            top,
+            gapWidth,
+            Math.Max(1, bottom - top),
+            separatorFraction,
+            0,
+            60,
+            80);
+    }
+}
+
+static void PaintBgraFraction(
+    byte[] pixels,
+    int stride,
+    int x,
+    int y,
+    int width,
+    int height,
+    double fraction,
+    byte r,
+    byte g,
+    byte b)
+{
+    var pixelCount = (int)Math.Round(width * height * fraction, MidpointRounding.AwayFromZero);
+    for (var index = 0; index < pixelCount; index++)
+    {
+        var xx = x + index % width;
+        var yy = y + index / width;
+        SetBgra(pixels, stride, xx, yy, r, g, b);
+    }
+}
+
+static void PaintNeutralShopHudFrame(
+    byte[] pixels,
+    int stride,
+    IReadOnlyList<RegionOfInterest> slots,
+    byte topBorderValue,
+    byte separatorValue)
+{
     foreach (var slot in slots)
     {
         FillBgra(
@@ -947,9 +1013,9 @@ static void ShopHudAcceptsGreyedChrome()
             Math.Max(0, slot.Y - 2),
             slot.Width,
             7,
-            34,
-            34,
-            34);
+            topBorderValue,
+            topBorderValue,
+            topBorderValue);
     }
 
     for (var i = 0; i < slots.Count - 1; i++)
@@ -968,15 +1034,136 @@ static void ShopHudAcceptsGreyedChrome()
             top,
             gapWidth,
             Math.Max(1, bottom - top),
-            32,
-            32,
-            32);
+            separatorValue,
+            separatorValue,
+            separatorValue);
     }
+}
+
+
+static void ShopHudAcceptsGreyedChrome()
+{
+    const int width = 1152;
+    const int height = 239;
+    const int stride = width * 4;
+    var pixels = new byte[stride * height];
+    FillBgra(pixels, stride, 0, 0, width, height, 18, 18, 18);
+
+    var slots = ShopSlotRecognizer.ProjectSlots(width, height);
+
+    // Draw the same repeated shop frame in a fully desaturated dark grey,
+    // modelling TFT's unaffordable/temporarily muted visual state.
+    PaintNeutralShopHudFrame(pixels, stride, slots, 34, 32);
 
     var recognizer = new ShopSlotRecognizer();
     var hud = recognizer.CheckHud(new Bgra32FrameBuffer(width, height, stride, pixels));
 
-    True(hud.IsVisible || hud.SupportsHold, "Greyed shop chrome must remain recognizable as shop HUD evidence.");
+    True(!hud.IsVisible, "Greyed shop chrome must not cold-start shop recognition.");
+    True(hud.SupportsHold, "Greyed shop chrome must sustain an already-confirmed shop.");
+    Equal(0, hud.TopBorderMatches);
+    Equal(0, hud.SeparatorMatches);
+    Equal(0d, hud.Confidence);
+}
+
+static void ShopHudAcceptsLowLumaGreyedChrome()
+{
+    const int width = 1152;
+    const int height = 239;
+    const int stride = width * 4;
+    var pixels = new byte[stride * height];
+    FillBgra(pixels, stride, 0, 0, width, height, 8, 8, 8);
+
+    var slots = ShopSlotRecognizer.ProjectSlots(width, height);
+
+    // Luminance-preserving desaturation of calibrated RGB(16,22,24) chrome
+    // is approximately RGB(21,21,21), below the previous neutral cutoff.
+    PaintNeutralShopHudFrame(pixels, stride, slots, 21, 20);
+
+    var recognizer = new ShopSlotRecognizer();
+    var hud = recognizer.CheckHud(new Bgra32FrameBuffer(width, height, stride, pixels));
+
+    True(!hud.IsVisible, "Low-luma greyed chrome must not cold-start shop recognition.");
+    True(hud.SupportsHold, "Low-luma greyed chrome must sustain an already-confirmed shop.");
+}
+
+static void ShopHudRejectsUniformNeutralScenery()
+{
+    const int width = 1152;
+    const int height = 239;
+    const int stride = width * 4;
+    var pixels = new byte[stride * height];
+
+    // A flat dark-grey scene satisfies a color-only neutral predicate at every
+    // projected anchor. It has no local frame contrast and is not shop evidence.
+    FillBgra(pixels, stride, 0, 0, width, height, 34, 34, 34);
+
+    var recognizer = new ShopSlotRecognizer();
+    var hud = recognizer.CheckHud(new Bgra32FrameBuffer(width, height, stride, pixels));
+
+    True(!hud.IsVisible, "Uniform neutral scenery must not activate the shop HUD.");
+    True(!hud.SupportsHold, "Uniform neutral scenery must not prolong a confirmed shop.");
+}
+
+static void ShopHudRejectsUniformTintedScenery()
+{
+    const int width = 1152;
+    const int height = 239;
+    const int stride = width * 4;
+    var recognizer = new ShopSlotRecognizer();
+
+    ReadOnlySpan<(byte R, byte G, byte B)> sceneryColors =
+    [
+        (34, 36, 36), // Capture noise around an otherwise neutral grey.
+        (16, 22, 24)  // Exact chromatic frame color without frame structure.
+    ];
+
+    foreach (var (r, g, b) in sceneryColors)
+    {
+        var pixels = new byte[stride * height];
+        FillBgra(pixels, stride, 0, 0, width, height, r, g, b);
+
+        var hud = recognizer.CheckHud(new Bgra32FrameBuffer(width, height, stride, pixels));
+        True(!hud.IsVisible, $"Uniform RGB({r},{g},{b}) scenery must not activate the shop HUD.");
+        True(!hud.SupportsHold, $"Uniform RGB({r},{g},{b}) scenery must not prolong a confirmed shop.");
+    }
+}
+
+static void ShopHudRejectsWeakFrameCoverage()
+{
+    const int width = 1152;
+    const int height = 239;
+    const int stride = width * 4;
+    var pixels = new byte[stride * height];
+    var slots = ShopSlotRecognizer.ProjectSlots(width, height);
+
+    // These ratios clear the regressed 0.24/0.14 thresholds but remain below
+    // the calibrated 0.28/0.18 activation thresholds.
+    PaintShopHudAnchorCoverage(pixels, stride, slots, 0.25, 0.15);
+
+    var recognizer = new ShopSlotRecognizer();
+    var hud = recognizer.CheckHud(new Bgra32FrameBuffer(width, height, stride, pixels));
+
+    True(!hud.IsVisible, "Sub-threshold frame coverage must not activate the shop HUD.");
+    Equal(0, hud.TopBorderMatches);
+    Equal(0, hud.SeparatorMatches);
+}
+
+static void ShopHudAcceptsCalibratedFrameCoverage()
+{
+    const int width = 1152;
+    const int height = 239;
+    const int stride = width * 4;
+    var pixels = new byte[stride * height];
+    var slots = ShopSlotRecognizer.ProjectSlots(width, height);
+
+    PaintShopHudAnchorCoverage(pixels, stride, slots, 0.29, 0.19);
+
+    var recognizer = new ShopSlotRecognizer();
+    var hud = recognizer.CheckHud(new Bgra32FrameBuffer(width, height, stride, pixels));
+
+    True(hud.IsVisible, "Coverage above the calibrated thresholds must activate the shop HUD.");
+    Equal(5, hud.TopBorderMatches);
+    Equal(4, hud.SeparatorMatches);
 }
 
 static void NormalizedWgcRoiProjectsDeterministically()
