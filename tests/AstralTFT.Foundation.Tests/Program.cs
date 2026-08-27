@@ -24,6 +24,7 @@ var tests = new (string Name, Action Run)[]
     ("Normalized layout projects to pixels", LayoutProjection),
     ("Luma detector ignores identical frames", LumaNoChange),
     ("Luma detector notices changed ROI", LumaChange),
+    ("Luma detector suppresses tiny jitter", LumaTinyJitter),
     ("Region selector honors priority", RegionPriority),
     ("Probable observation requires confirmation", FusionNeedsConfirmation),
     ("Low confidence cannot erase stable state", FusionRetainsStable),
@@ -107,6 +108,18 @@ static void LumaChange()
     var changed = detector.Compare(Frame(2, 8, 8, 220), roi);
     True(changed.IsMeaningful, "Large luminance change must be detected.");
     True(changed.ChangeScore > .5, "Expected a strong change score.");
+}
+
+
+static void LumaTinyJitter()
+{
+    var detector = new GridLumaRegionChangeDetector(4, 4, .025);
+    var roi = new RegionOfInterest("shop", 0, 0, 8, 8);
+    _ = detector.Compare(Frame(1, 8, 8, 80), roi);
+    var changed = detector.Compare(Frame(2, 8, 8, 82), roi);
+
+    True(!changed.IsMeaningful, "Two luminance levels of jitter should stay below the shop-change threshold.");
+    True(changed.ChangeScore < .025, "Tiny jitter score should remain below the configured threshold.");
 }
 
 static void RegionPriority()

@@ -7,6 +7,12 @@ using AstralTFT.Capture.Windows;
 
 namespace AstralTFT.App.Diagnostics;
 
+internal sealed record RegionChangeBenchmarkConfiguration(
+    string RegionId,
+    int GridColumns,
+    int GridRows,
+    double MeaningfulThreshold);
+
 /// <summary>
 /// Records objective capture-overhead data so the first Windows benchmark can be
 /// diagnosed without screenshots or manually transcribing counters. It records
@@ -17,19 +23,27 @@ internal sealed class CaptureBenchmarkRecorder
     private readonly object _gate = new();
     private readonly GameWindow _window;
     private readonly WgcCaptureOptions _options;
+    private readonly RegionChangeBenchmarkConfiguration? _changeConfiguration;
     private readonly DateTimeOffset _startedAt = DateTimeOffset.UtcNow;
     private readonly List<double> _readbackMs = [];
+    private readonly List<double> _regionChangeScores = [];
+    private readonly List<double> _regionChangeProcessingUs = [];
     private readonly List<ProcessMetricSample> _processSamples = [];
+    private long _meaningfulRegionChanges;
     private WgcCaptureTelemetry? _lastTelemetry;
     private long _lastReadbackCount;
     private TimeSpan _previousCpu;
     private DateTimeOffset _previousProcessSampleAt;
     private Task<string?>? _completionTask;
 
-    public CaptureBenchmarkRecorder(GameWindow window, WgcCaptureOptions options)
+    public CaptureBenchmarkRecorder(
+        GameWindow window,
+        WgcCaptureOptions options,
+        RegionChangeBenchmarkConfiguration? changeConfiguration = null)
     {
         _window = window;
         _options = options;
+        _changeConfiguration = changeConfiguration;
         using var process = Process.GetCurrentProcess();
         _previousCpu = process.TotalProcessorTime;
         _previousProcessSampleAt = DateTimeOffset.UtcNow;
@@ -47,6 +61,17 @@ internal sealed class CaptureBenchmarkRecorder
                 _readbackMs.Add(telemetry.LastReadbackDuration.TotalMilliseconds);
                 _lastReadbackCount = telemetry.FramesReadBack;
             }
+        }
+    }
+
+    public void RecordRegionChange(RegionChange change, TimeSpan processingTime)
+    {
+        lock (_gate)
+        {
+            _regionChangeScores.Add(Math.Clamp(change.ChangeScore, 0, 1));
+            _regionChangeProcessingUs.Add(Math.Max(0, processingTime.TotalMicroseconds));
+            if (change.IsMeaningful)
+                _meaningfulRegionChanges++;
         }
     }
 
@@ -92,13 +117,15 @@ internal sealed class CaptureBenchmarkRecorder
     private CaptureBenchmarkReport BuildReportLocked(WgcCaptureEndReason endReason, Exception? error)
     {
         var readbacks = _readbackMs.Order().ToArray();
+        var changeScores = _regionChangeScores.Order().ToArray();
+        var changeProcessingUs = _regionChangeProcessingUs.Order().ToArray();
         var process = _processSamples.ToArray();
         var final = _lastTelemetry;
         var endedAt = DateTimeOffset.UtcNow;
         var duration = endedAt - _startedAt;
 
         return new CaptureBenchmarkReport(
-            SchemaVersion: 3,
+            SchemaVersion: 4,
             AppVersion: Assembly.GetExecutingAssembly().GetName().Version?.ToString() ?? "dev",
             StartedAtUtc: _startedAt,
             EndedAtUtc: endedAt,
@@ -126,12 +153,53 @@ internal sealed class CaptureBenchmarkRecorder
                 P95Ms: Percentile(readbacks, 0.95),
                 P99Ms: Percentile(readbacks, 0.99),
                 MaxMs: readbacks.Length == 0 ? 0 : readbacks[^1]),
+            RegionChangeConfiguration: _changeConfiguration,
+            RegionChange: BuildRegionChangeStatistics(
+                changeScores,
+                changeProcessingUs,
+                _meaningfulRegionChanges,
+                duration),
             Process: BuildProcessStatistics(process),
             SteadyStateProcess: BuildProcessStatistics(
                 process.Where(x => x.AtUtc - _startedAt >= TimeSpan.FromSeconds(15)).ToArray()),
             SteadyStateWarmupExcludedSeconds: 15,
             Samples: process,
             Privacy: "AstralTFT process metrics + TFT window metadata only; no TFT process memory is read.");
+    }
+
+    private static RegionChangeStatistics BuildRegionChangeStatistics(
+        double[] scores,
+        double[] processingUs,
+        long meaningfulCount,
+        TimeSpan duration)
+    {
+        var count = scores.Length;
+        var meaningful = Math.Clamp(meaningfulCount, 0, count);
+        var baselineFrames = count > 0 ? 1 : 0;
+        var meaningfulExcludingBaseline = Math.Max(0, meaningful - baselineFrames);
+        var comparableFrames = Math.Max(0, count - baselineFrames);
+        var meaningfulPercent = comparableFrames == 0
+            ? 0
+            : meaningfulExcludingBaseline * 100.0 / comparableFrames;
+
+        return new RegionChangeStatistics(
+            Count: count,
+            BaselineFrames: baselineFrames,
+            MeaningfulCount: meaningful,
+            MeaningfulCountExcludingBaseline: meaningfulExcludingBaseline,
+            SuppressedCountExcludingBaseline: Math.Max(0, comparableFrames - meaningfulExcludingBaseline),
+            MeaningfulPercentExcludingBaseline: meaningfulPercent,
+            MeaningfulChangesPerMinute: duration.TotalMinutes <= 0
+                ? 0
+                : meaningfulExcludingBaseline / duration.TotalMinutes,
+            AverageScore: Average(scores),
+            P95Score: Percentile(scores, 0.95),
+            P99Score: Percentile(scores, 0.99),
+            MaxScore: scores.Length == 0 ? 0 : scores[^1],
+            AverageProcessingUs: Average(processingUs),
+            P95ProcessingUs: Percentile(processingUs, 0.95),
+            P99ProcessingUs: Percentile(processingUs, 0.99),
+            MaxProcessingUs: processingUs.Length == 0 ? 0 : processingUs[^1]);
     }
 
     private static ProcessStatistics BuildProcessStatistics(ProcessMetricSample[] process)
@@ -228,6 +296,8 @@ internal sealed class CaptureBenchmarkRecorder
         WgcCaptureOptions CaptureOptions,
         WgcCaptureTelemetry? Capture,
         ReadbackStatistics Readback,
+        RegionChangeBenchmarkConfiguration? RegionChangeConfiguration,
+        RegionChangeStatistics RegionChange,
         ProcessStatistics Process,
         ProcessStatistics SteadyStateProcess,
         int SteadyStateWarmupExcludedSeconds,
@@ -255,6 +325,23 @@ internal sealed class CaptureBenchmarkRecorder
         double P95Ms,
         double P99Ms,
         double MaxMs);
+
+    private sealed record RegionChangeStatistics(
+        int Count,
+        int BaselineFrames,
+        long MeaningfulCount,
+        long MeaningfulCountExcludingBaseline,
+        long SuppressedCountExcludingBaseline,
+        double MeaningfulPercentExcludingBaseline,
+        double MeaningfulChangesPerMinute,
+        double AverageScore,
+        double P95Score,
+        double P99Score,
+        double MaxScore,
+        double AverageProcessingUs,
+        double P95ProcessingUs,
+        double P99ProcessingUs,
+        double MaxProcessingUs);
 
     private sealed record ProcessStatistics(
         int SampleCount,

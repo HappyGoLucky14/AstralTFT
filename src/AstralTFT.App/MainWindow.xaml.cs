@@ -1,15 +1,21 @@
 using System.ComponentModel;
+using System.Diagnostics;
 using System.Runtime.CompilerServices;
 using System.Windows;
 using System.Windows.Media;
 using AstralTFT.App.Diagnostics;
 using AstralTFT.Capture.Abstractions;
+using AstralTFT.Capture.Regions;
 using AstralTFT.Capture.Windows;
 
 namespace AstralTFT.App;
 
 public partial class MainWindow : Window, INotifyPropertyChanged
 {
+    private const int ShopChangeGridColumns = 24;
+    private const int ShopChangeGridRows = 6;
+    private const double ShopMeaningfulChangeThreshold = 0.025;
+
     private static readonly WgcCaptureOptions DiagnosticCaptureOptions = new(
         MaxCpuReadbacksPerSecond: 10,
         FramePoolBufferCount: 2,
@@ -146,7 +152,18 @@ public partial class MainWindow : Window, INotifyPropertyChanged
         await StopCaptureAsync(WgcCaptureEndReason.Requested, null);
 
         var source = new WindowsGraphicsCaptureFrameSource(game, DiagnosticCaptureOptions);
-        var benchmark = new CaptureBenchmarkRecorder(game, DiagnosticCaptureOptions);
+        var benchmark = new CaptureBenchmarkRecorder(
+            game,
+            DiagnosticCaptureOptions,
+            new RegionChangeBenchmarkConfiguration(
+                RegionId: "shop-band-change-benchmark",
+                GridColumns: ShopChangeGridColumns,
+                GridRows: ShopChangeGridRows,
+                MeaningfulThreshold: ShopMeaningfulChangeThreshold));
+        var changeDetector = new GridLumaRegionChangeDetector(
+            ShopChangeGridColumns,
+            ShopChangeGridRows,
+            ShopMeaningfulChangeThreshold);
         source.TelemetryUpdated += OnCaptureTelemetry;
         source.CaptureFaulted += OnCaptureFaulted;
         source.CaptureEnded += OnCaptureEnded;
@@ -162,7 +179,7 @@ public partial class MainWindow : Window, INotifyPropertyChanged
             await source.StartAsync(cancellationToken);
             CaptureState = "Capturing TFT window";
             FooterText = "Capture-only benchmark active. Metrics will be written automatically to LocalAppData\\AstralTFT\\Diagnostics.";
-            _captureTask = ConsumeFramesAsync(source, _shutdown.Token);
+            _captureTask = ConsumeFramesAsync(source, benchmark, changeDetector, _shutdown.Token);
 
             _captureSamplerCts = CancellationTokenSource.CreateLinkedTokenSource(_shutdown.Token);
             _captureSamplerTask = SampleBenchmarkAsync(benchmark, _captureSamplerCts.Token);
@@ -181,7 +198,11 @@ public partial class MainWindow : Window, INotifyPropertyChanged
         }
     }
 
-    private async Task ConsumeFramesAsync(WindowsGraphicsCaptureFrameSource source, CancellationToken cancellationToken)
+    private static async Task ConsumeFramesAsync(
+        WindowsGraphicsCaptureFrameSource source,
+        CaptureBenchmarkRecorder benchmark,
+        GridLumaRegionChangeDetector changeDetector,
+        CancellationToken cancellationToken)
     {
         try
         {
@@ -189,9 +210,20 @@ public partial class MainWindow : Window, INotifyPropertyChanged
             {
                 using (frame)
                 {
-                    // Intentionally no CV in this gate. Consuming and disposing the
-                    // newest-frame stream validates WGC, pooling, lifetime, and backpressure.
-                    _ = frame.Sequence;
+                    // This is deliberately still recognition-free. We only fingerprint
+                    // the CPU-visible shop ROI to measure how many expensive downstream
+                    // recognition passes could be suppressed by a tiny sampled luma grid.
+                    var region = new RegionOfInterest(
+                        "shop-band-change-benchmark",
+                        0,
+                        0,
+                        frame.Width,
+                        frame.Height);
+
+                    var started = Stopwatch.GetTimestamp();
+                    var change = changeDetector.Compare(frame, region);
+                    var elapsed = Stopwatch.GetElapsedTime(started);
+                    benchmark.RecordRegionChange(change, elapsed);
                 }
             }
         }
