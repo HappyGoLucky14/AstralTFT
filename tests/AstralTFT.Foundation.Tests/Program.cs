@@ -1,6 +1,7 @@
 using AstralTFT.Capture.Abstractions;
 using AstralTFT.Capture.Regions;
 using AstralTFT.Capture.Recognition;
+using AstralTFT.Capture.Replay;
 using AstralTFT.Capture.Windows;
 using AstralTFT.Core.Models;
 using AstralTFT.Meta.Ensembling;
@@ -64,6 +65,8 @@ var tests = new (string Name, Action Run)[]
     ("Shop HUD rejects uniform tinted scenery", ShopHudRejectsUniformTintedScenery),
     ("Shop HUD rejects weak frame coverage", ShopHudRejectsWeakFrameCoverage),
     ("Shop HUD accepts calibrated frame coverage", ShopHudAcceptsCalibratedFrameCoverage),
+    ("Corpus hash is deterministic and geometry-sensitive", CorpusHashIsDeterministic),
+    ("Corpus contracts reject unsafe geometry", CorpusContractsRejectUnsafeGeometry),
 };
 
 var failures = new List<string>();
@@ -659,6 +662,39 @@ static void Equal<T>(T expected, T actual)
 static void True(bool value, string message)
 {
     if (!value) throw new InvalidOperationException(message);
+}
+
+static void Throws<TException>(Action action)
+    where TException : Exception
+{
+    try
+    {
+        action();
+    }
+    catch (TException)
+    {
+        return;
+    }
+
+    throw new InvalidOperationException($"Expected {typeof(TException).Name}.");
+}
+
+static void CorpusHashIsDeterministic()
+{
+    byte[] pixels = [1, 2, 3, 255, 4, 5, 6, 255];
+    var first = RegionCorpusHasher.ComputeHash(2, 1, 8, pixels);
+    var second = RegionCorpusHasher.ComputeHash(2, 1, 8, pixels);
+    Equal(first, second);
+    Equal(64, first.Length);
+    True(first.All(c => char.IsAsciiHexDigitLower(c) || char.IsDigit(c)), "Hash must be lowercase hexadecimal.");
+    True(first != RegionCorpusHasher.ComputeHash(1, 2, 4, pixels), "Geometry must participate in the hash.");
+}
+
+static void CorpusContractsRejectUnsafeGeometry()
+{
+    Throws<ArgumentOutOfRangeException>(() => RegionCorpusHasher.ComputeHash(0, 1, 4, new byte[4]));
+    Throws<ArgumentOutOfRangeException>(() => RegionCorpusHasher.ComputeHash(4097, 1, 4097 * 4, new byte[4097 * 4]));
+    Throws<ArgumentException>(() => RegionCorpusHasher.ComputeHash(2, 1, 8, new byte[7]));
 }
 
 
