@@ -57,6 +57,7 @@ var tests = new (string Name, Action Run)[]
     ("Shop structure recognizer finds empty and cost tiers", ShopStructureRecognition),
     ("Shop cost bar median resists glyph noise", ShopCostBarMedianResistsGlyphNoise),
     ("Shop HUD gate rejects incomplete false positives", ShopHudGateRejectsIncompleteFalsePositives),
+    ("Shop HUD requires repeated frame anchors", ShopHudRequiresFrameAnchors),
 };
 
 var failures = new List<string>();
@@ -668,6 +669,7 @@ static void ShopStructureRecognition()
 
     var slots = ShopSlotRecognizer.ProjectSlots(width, height);
     Equal(5, slots.Count);
+    PaintSyntheticShopHudFrame(pixels, stride, slots);
 
     // Leave slot 1 empty. Fill slots 2-5 with textured portrait signal plus
     // the exact Set 18 cost-bar color families seen in the calibration frame.
@@ -852,6 +854,74 @@ static void ShopHudGateRejectsIncompleteFalsePositives()
 
     True(!result.IsShopHudVisible, "Incomplete/ambiguous slot structure must not activate the shop HUD.");
     True(result.KnownSlotCount < 5, "False-positive frame should not resolve all five slots.");
+}
+
+
+static void ShopHudRequiresFrameAnchors()
+{
+    const int width = 1152;
+    const int height = 239;
+    const int stride = width * 4;
+    var pixels = new byte[stride * height];
+    FillBgra(pixels, stride, 0, 0, width, height, 14, 14, 10);
+
+    var slots = ShopSlotRecognizer.ProjectSlots(width, height);
+
+    // Five plausible card-like regions are intentionally not enough. Carousel,
+    // loading, or board scenery can accidentally classify as costs; without the
+    // repeated TFT shop-frame anchors recognition must remain inactive.
+    PaintSyntheticShopUnit(pixels, stride, slots[0], 24, 38, 50);
+    PaintSyntheticShopUnit(pixels, stride, slots[1], 96, 67, 24);
+    PaintSyntheticShopUnit(pixels, stride, slots[2], 28, 39, 75);
+    PaintSyntheticShopUnit(pixels, stride, slots[3], 76, 31, 86);
+    PaintSyntheticShopUnit(pixels, stride, slots[4], 104, 72, 25);
+
+    var recognizer = new ShopSlotRecognizer();
+    var buffer = new Bgra32FrameBuffer(width, height, stride, pixels);
+    var hud = recognizer.CheckHud(buffer);
+
+    True(!hud.IsVisible, "Five card-like regions without shop-frame anchors must stay inactive.");
+}
+
+static void PaintSyntheticShopHudFrame(
+    byte[] pixels,
+    int stride,
+    IReadOnlyList<RegionOfInterest> slots)
+{
+    foreach (var slot in slots)
+    {
+        FillBgra(
+            pixels,
+            stride,
+            slot.X,
+            Math.Max(0, slot.Y - 2),
+            slot.Width,
+            7,
+            16,
+            22,
+            24);
+    }
+
+    for (var i = 0; i < slots.Count - 1; i++)
+    {
+        var left = slots[i];
+        var right = slots[i + 1];
+        var gapX = left.X + left.Width;
+        var gapWidth = Math.Max(1, right.X - gapX);
+        var top = Math.Max(left.Y, right.Y) + 8;
+        var bottom = Math.Min(left.Y + left.Height, right.Y + right.Height) - 8;
+
+        FillBgra(
+            pixels,
+            stride,
+            gapX,
+            top,
+            gapWidth,
+            Math.Max(1, bottom - top),
+            16,
+            22,
+            24);
+    }
 }
 
 static void NormalizedWgcRoiProjectsDeterministically()

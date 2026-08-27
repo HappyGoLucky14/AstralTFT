@@ -17,8 +17,15 @@ public sealed record ShopSlotReading(
     ulong VisualHash,
     RegionOfInterest Region);
 
+public sealed record ShopHudObservation(
+    bool IsVisible,
+    double Confidence,
+    int TopBorderMatches,
+    int SeparatorMatches);
+
 public sealed record ShopRecognitionResult(
     IReadOnlyList<ShopSlotReading> Slots,
+    ShopHudObservation Hud,
     bool IsShopHudVisible,
     int KnownSlotCount,
     int UnitSlotCount,
@@ -74,12 +81,82 @@ public sealed class ShopSlotRecognizer
         return projected;
     }
 
+    public ShopHudObservation CheckHud(Bgra32FrameBuffer buffer)
+    {
+        ArgumentNullException.ThrowIfNull(buffer);
+        buffer.Validate();
+
+        var regions = ProjectSlots(buffer.Width, buffer.Height);
+        var pixels = buffer.Pixels.Span;
+
+        var topBorderMatches = 0;
+        foreach (var region in regions)
+        {
+            var stripTop = Math.Clamp(region.Y - 2, 0, buffer.Height - 1);
+            var stripBottom = Math.Clamp(region.Y + 5, stripTop + 1, buffer.Height);
+            var ratio = MeasureFramePixelRatio(
+                pixels,
+                buffer.Stride,
+                region.X,
+                stripTop,
+                region.Width,
+                stripBottom - stripTop);
+
+            if (ratio >= 0.28)
+                topBorderMatches++;
+        }
+
+        var separatorMatches = 0;
+        for (var i = 0; i < regions.Count - 1; i++)
+        {
+            var left = regions[i];
+            var right = regions[i + 1];
+
+            var gapLeft = left.X + left.Width;
+            var gapRight = right.X;
+            if (gapRight <= gapLeft)
+                continue;
+
+            var stripTop = Math.Max(left.Y, right.Y) + 8;
+            var stripBottom = Math.Min(left.Y + left.Height, right.Y + right.Height) - 8;
+            if (stripBottom <= stripTop)
+                continue;
+
+            var ratio = MeasureFramePixelRatio(
+                pixels,
+                buffer.Stride,
+                gapLeft,
+                stripTop,
+                gapRight - gapLeft,
+                stripBottom - stripTop);
+
+            if (ratio >= 0.18)
+                separatorMatches++;
+        }
+
+        var confidence =
+            (topBorderMatches / 5d) * 0.55 +
+            (separatorMatches / 4d) * 0.45;
+
+        var isVisible =
+            topBorderMatches >= 4 &&
+            separatorMatches >= 3 &&
+            confidence >= 0.75;
+
+        return new ShopHudObservation(
+            IsVisible: isVisible,
+            Confidence: confidence,
+            TopBorderMatches: topBorderMatches,
+            SeparatorMatches: separatorMatches);
+    }
+
     public ShopRecognitionResult Recognize(Bgra32FrameBuffer buffer)
     {
         ArgumentNullException.ThrowIfNull(buffer);
         buffer.Validate();
 
         var started = System.Diagnostics.Stopwatch.GetTimestamp();
+        var hud = CheckHud(buffer);
         var regions = ProjectSlots(buffer.Width, buffer.Height);
         var readings = new ShopSlotReading[regions.Count];
 
@@ -89,21 +166,54 @@ public sealed class ShopSlotRecognizer
         var knownSlotCount = readings.Count(IsStructurallyKnown);
         var unitSlotCount = readings.Count(x => x.Occupancy == ShopSlotOccupancy.Unit);
 
-        // Do not surface shop guesses merely because the TFT render window exists.
-        // A real shop row must resolve all five slots into a coherent card state,
-        // and at least one slot must contain a unit. Loading/front-end scenes often
-        // contain enough color/texture to fool individual slot heuristics, but they
-        // do not produce a complete five-card TFT shop structure.
-        var isShopHudVisible =
-            knownSlotCount == readings.Length &&
-            unitSlotCount >= 1;
-
         return new ShopRecognitionResult(
             readings,
-            IsShopHudVisible: isShopHudVisible,
+            Hud: hud,
+            IsShopHudVisible: hud.IsVisible,
             KnownSlotCount: knownSlotCount,
             UnitSlotCount: unitSlotCount,
             ProcessingTime: System.Diagnostics.Stopwatch.GetElapsedTime(started));
+    }
+
+    private static double MeasureFramePixelRatio(
+        ReadOnlySpan<byte> pixels,
+        int stride,
+        int x,
+        int y,
+        int width,
+        int height)
+    {
+        if (width <= 0 || height <= 0)
+            return 0;
+
+        long matches = 0;
+        long count = 0;
+
+        for (var yy = y; yy < y + height; yy++)
+        {
+            for (var xx = x; xx < x + width; xx++)
+            {
+                var offset = checked(yy * stride + xx * 4);
+                var b = pixels[offset];
+                var g = pixels[offset + 1];
+                var r = pixels[offset + 2];
+                var max = Math.Max(r, Math.Max(g, b));
+
+                if (max <= 80 &&
+                    r <= 55 &&
+                    g >= r &&
+                    b >= r &&
+                    g - r >= 2 &&
+                    b - r >= 2)
+                {
+                    matches++;
+                }
+
+                count++;
+            }
+        }
+
+        return count == 0 ? 0 : matches / (double)count;
     }
 
     private static bool IsStructurallyKnown(ShopSlotReading slot)

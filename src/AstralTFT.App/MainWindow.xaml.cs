@@ -33,6 +33,7 @@ public partial class MainWindow : Window, INotifyPropertyChanged
     private readonly ShopSlotRecognizer _shopRecognizer = new();
     private readonly CancellationTokenSource _shutdown = new();
     private int _shopHudConfirmationFrames;
+    private int _shopHudMissingFrames;
     private bool _shopHudConfirmed;
     private WindowsGraphicsCaptureFrameSource? _captureSource;
     private Task? _captureTask;
@@ -235,64 +236,81 @@ public partial class MainWindow : Window, INotifyPropertyChanged
 
                     if (frame.NativeFrameHandle is Bgra32FrameBuffer pixels)
                     {
-                        ShopRecognitionResult? shop = null;
+                        // Screen-state detection is separate from slot classification.
+                        // Probe only the fixed/repeated TFT shop-frame anchors every
+                        // accepted ROI frame. Full slot recognition still wakes only
+                        // when the ROI meaningfully changes.
+                        var hud = _shopRecognizer.CheckHud(pixels);
+                        var justConfirmed = false;
+                        var justLost = false;
 
-                        // Before the HUD is confirmed, probe each accepted ROI frame.
-                        // Three consecutive coherent five-card readings are required,
-                        // preventing loading/front-end imagery from becoming "ACTIVE".
-                        if (!_shopHudConfirmed)
+                        if (hud.IsVisible)
                         {
-                            shop = _shopRecognizer.Recognize(pixels);
+                            _shopHudMissingFrames = 0;
 
-                            if (shop.IsShopHudVisible)
+                            if (!_shopHudConfirmed)
                             {
                                 _shopHudConfirmationFrames++;
                                 if (_shopHudConfirmationFrames >= 3)
+                                {
                                     _shopHudConfirmed = true;
-                            }
-                            else
-                            {
-                                _shopHudConfirmationFrames = 0;
+                                    justConfirmed = true;
+                                }
                             }
                         }
-                        else if (change.IsMeaningful)
+                        else
                         {
-                            shop = _shopRecognizer.Recognize(pixels);
+                            _shopHudConfirmationFrames = 0;
 
-                            // Leaving the shop/game should immediately stop surfacing the
-                            // previous structure instead of leaving stale or invented data.
-                            if (!shop.IsShopHudVisible)
+                            if (_shopHudConfirmed)
                             {
-                                _shopHudConfirmed = false;
-                                _shopHudConfirmationFrames = 0;
+                                _shopHudMissingFrames++;
+                                if (_shopHudMissingFrames >= 2)
+                                {
+                                    _shopHudConfirmed = false;
+                                    _shopHudMissingFrames = 0;
+                                    justLost = true;
+                                }
                             }
                         }
 
-                        if (shop is not null)
+                        if (justLost)
                         {
-                            if (_shopHudConfirmed && shop.IsShopHudVisible)
+                            await Dispatcher.InvokeAsync(() =>
                             {
-                                var summary = string.Join(
-                                    "  •  ",
-                                    shop.Slots.Select(FormatShopSlot));
+                                RecognitionState = "INACTIVE";
+                                RecognitionDetails =
+                                    $"Shop HUD not present • anchors {hud.TopBorderMatches}/5 top, {hud.SeparatorMatches}/4 separators. No shop guesses are shown.";
+                                FooterText = "Non-shop scene detected; shop recognition is sleeping.";
+                            });
+                        }
+                        else if (_shopHudConfirmed &&
+                                 hud.IsVisible &&
+                                 (justConfirmed || change.IsMeaningful))
+                        {
+                            var shop = _shopRecognizer.Recognize(pixels);
+                            var summary = string.Join(
+                                "  •  ",
+                                shop.Slots.Select(FormatShopSlot));
 
-                                await Dispatcher.InvokeAsync(() =>
-                                {
-                                    RecognitionState = "ACTIVE";
-                                    RecognitionDetails = summary;
-                                    FooterText = $"Shop HUD confirmed • structural recognition {shop.ProcessingTime.TotalMicroseconds:F1} µs • champion-name matching is the next gate.";
-                                });
-                            }
-                            else
+                            await Dispatcher.InvokeAsync(() =>
                             {
-                                var progress = Math.Clamp(_shopHudConfirmationFrames, 0, 3);
-                                await Dispatcher.InvokeAsync(() =>
-                                {
-                                    RecognitionState = "WAITING";
-                                    RecognitionDetails = $"Shop HUD not confirmed ({progress}/3). No slot guesses are shown.";
-                                    FooterText = "AstralTFT is waiting for the real in-match shop HUD before surfacing recognition.";
-                                });
-                            }
+                                RecognitionState = "ACTIVE";
+                                RecognitionDetails = summary;
+                                FooterText =
+                                    $"Shop HUD confirmed ({shop.Hud.TopBorderMatches}/5 top, {shop.Hud.SeparatorMatches}/4 separators) • structural recognition {shop.ProcessingTime.TotalMicroseconds:F1} µs.";
+                            });
+                        }
+                        else if (!_shopHudConfirmed)
+                        {
+                            var progress = Math.Clamp(_shopHudConfirmationFrames, 0, 3);
+                            await Dispatcher.InvokeAsync(() =>
+                            {
+                                RecognitionState = "WAITING";
+                                RecognitionDetails =
+                                    $"Shop HUD not confirmed ({progress}/3) • anchors {hud.TopBorderMatches}/5 top, {hud.SeparatorMatches}/4 separators. No slot guesses are shown.";
+                                FooterText = "AstralTFT is waiting for the real in-match shop frame before surfacing recognition.";
+                            });
                         }
                     }
                 }
