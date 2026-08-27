@@ -6,6 +6,7 @@ using System.Windows.Media;
 using AstralTFT.App.Diagnostics;
 using AstralTFT.Capture.Abstractions;
 using AstralTFT.Capture.Regions;
+using AstralTFT.Capture.Recognition;
 using AstralTFT.Capture.Windows;
 
 namespace AstralTFT.App;
@@ -29,6 +30,7 @@ public partial class MainWindow : Window, INotifyPropertyChanged
             Height: 0.22));
 
     private readonly TftWindowLocator _locator = new();
+    private readonly ShopSlotRecognizer _shopRecognizer = new();
     private readonly CancellationTokenSource _shutdown = new();
     private WindowsGraphicsCaptureFrameSource? _captureSource;
     private Task? _captureTask;
@@ -53,7 +55,9 @@ public partial class MainWindow : Window, INotifyPropertyChanged
     private string _readbackText = "—";
     private string _dropText = "—";
     private string _captureDetails = "Capture starts automatically after the TFT match window is detected.";
-    private string _footerText = "Diagnostic build: no OCR or ML yet. This isolates capture overhead before recognition is enabled.";
+    private string _recognitionState = "WAITING";
+    private string _recognitionDetails = "Waiting for the first meaningful shop change.";
+    private string _footerText = "Structural shop recognition is enabled without OCR or game-memory access.";
 
     public MainWindow()
     {
@@ -74,6 +78,8 @@ public partial class MainWindow : Window, INotifyPropertyChanged
     public string ReadbackText { get => _readbackText; private set => Set(ref _readbackText, value); }
     public string DropText { get => _dropText; private set => Set(ref _dropText, value); }
     public string CaptureDetails { get => _captureDetails; private set => Set(ref _captureDetails, value); }
+    public string RecognitionState { get => _recognitionState; private set => Set(ref _recognitionState, value); }
+    public string RecognitionDetails { get => _recognitionDetails; private set => Set(ref _recognitionDetails, value); }
     public string FooterText { get => _footerText; private set => Set(ref _footerText, value); }
 
     private async Task RunDiscoveryLoopAsync(CancellationToken cancellationToken)
@@ -224,6 +230,22 @@ public partial class MainWindow : Window, INotifyPropertyChanged
                     var change = changeDetector.Compare(frame, region);
                     var elapsed = Stopwatch.GetElapsedTime(started);
                     benchmark.RecordRegionChange(change, elapsed);
+
+                    if (change.IsMeaningful &&
+                        frame.NativeFrameHandle is Bgra32FrameBuffer pixels)
+                    {
+                        var shop = _shopRecognizer.Recognize(pixels);
+                        var summary = string.Join(
+                            "  •  ",
+                            shop.Slots.Select(FormatShopSlot));
+
+                        await Dispatcher.InvokeAsync(() =>
+                        {
+                            RecognitionState = "ACTIVE";
+                            RecognitionDetails = summary;
+                            FooterText = $"Structural recognition {shop.ProcessingTime.TotalMicroseconds:F1} µs • champion-name matching is the next gate.";
+                        });
+                    }
                 }
             }
         }
@@ -253,6 +275,18 @@ public partial class MainWindow : Window, INotifyPropertyChanged
         catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested)
         {
         }
+    }
+
+    private static string FormatShopSlot(ShopSlotReading slot)
+    {
+        return slot.Occupancy switch
+        {
+            ShopSlotOccupancy.Empty => $"S{slot.SlotIndex}: empty",
+            ShopSlotOccupancy.Unit when slot.CostTier is >= 1 and <= 5
+                => $"S{slot.SlotIndex}: {slot.CostTier}-cost",
+            ShopSlotOccupancy.Unit => $"S{slot.SlotIndex}: unit",
+            _ => $"S{slot.SlotIndex}: unknown"
+        };
     }
 
     private void OnCaptureTelemetry(object? sender, WgcCaptureTelemetry telemetry)

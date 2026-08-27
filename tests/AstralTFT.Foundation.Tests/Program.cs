@@ -54,6 +54,7 @@ var tests = new (string Name, Action Run)[]
     ("Frame pump disposes capture lease after ROI routing", FramePumpDisposesCaptureLease),
     ("TFT window selector rejects guide/browser false positives", TftWindowSelectorRejectsFalsePositives),
     ("Normalized WGC ROI projects deterministically", NormalizedWgcRoiProjectsDeterministically),
+    ("Shop structure recognizer finds empty and cost tiers", ShopStructureRecognition),
 };
 
 var failures = new List<string>();
@@ -651,6 +652,105 @@ static void True(bool value, string message)
     if (!value) throw new InvalidOperationException(message);
 }
 
+
+
+static void ShopStructureRecognition()
+{
+    const int width = 1152;
+    const int height = 239;
+    const int stride = width * 4;
+    var pixels = new byte[stride * height];
+
+    // Dark baseline approximates a bought/empty shop card.
+    FillBgra(pixels, stride, 0, 0, width, height, 12, 12, 6);
+
+    var slots = ShopSlotRecognizer.ProjectSlots(width, height);
+    Equal(5, slots.Count);
+
+    // Leave slot 1 empty. Fill slots 2-5 with textured portrait signal plus
+    // the exact Set 18 cost-bar color families seen in the calibration frame.
+    PaintSyntheticShopUnit(pixels, stride, slots[1], 18, 53, 44); // 2-cost green
+    PaintSyntheticShopUnit(pixels, stride, slots[2], 23, 37, 50); // 1-cost blue-grey
+    PaintSyntheticShopUnit(pixels, stride, slots[3], 18, 53, 44); // 2-cost green
+    PaintSyntheticShopUnit(pixels, stride, slots[4], 28, 31, 71); // 3-cost blue
+
+    var recognizer = new ShopSlotRecognizer();
+    var result = recognizer.Recognize(new Bgra32FrameBuffer(width, height, stride, pixels));
+
+    Equal(ShopSlotOccupancy.Empty, result.Slots[0].Occupancy);
+    Equal(0, result.Slots[0].CostTier);
+
+    Equal(ShopSlotOccupancy.Unit, result.Slots[1].Occupancy);
+    Equal(2, result.Slots[1].CostTier);
+
+    Equal(ShopSlotOccupancy.Unit, result.Slots[2].Occupancy);
+    Equal(1, result.Slots[2].CostTier);
+
+    Equal(ShopSlotOccupancy.Unit, result.Slots[3].Occupancy);
+    Equal(2, result.Slots[3].CostTier);
+
+    Equal(ShopSlotOccupancy.Unit, result.Slots[4].Occupancy);
+    Equal(3, result.Slots[4].CostTier);
+}
+
+static void PaintSyntheticShopUnit(
+    byte[] pixels,
+    int stride,
+    RegionOfInterest slot,
+    byte rBar,
+    byte gBar,
+    byte bBar)
+{
+    // High-variance checkerboard creates obvious portrait/trait visual structure.
+    for (var y = slot.Y; y < slot.Y + slot.Height; y++)
+    {
+        for (var x = slot.X; x < slot.X + slot.Width; x++)
+        {
+            var bright = ((x / 8) + (y / 8)) % 2 == 0;
+            var value = (byte)(bright ? 175 : 35);
+            SetBgra(pixels, stride, x, y, value, value, value);
+        }
+    }
+
+    var barY = slot.Y + (int)Math.Round(slot.Height * 0.80);
+    FillBgra(
+        pixels,
+        stride,
+        slot.X,
+        barY,
+        slot.Width,
+        slot.Y + slot.Height - barY,
+        rBar,
+        gBar,
+        bBar);
+}
+
+static void FillBgra(
+    byte[] pixels,
+    int stride,
+    int x,
+    int y,
+    int width,
+    int height,
+    byte r,
+    byte g,
+    byte b)
+{
+    for (var yy = y; yy < y + height; yy++)
+    {
+        for (var xx = x; xx < x + width; xx++)
+            SetBgra(pixels, stride, xx, yy, r, g, b);
+    }
+}
+
+static void SetBgra(byte[] pixels, int stride, int x, int y, byte r, byte g, byte b)
+{
+    var offset = y * stride + x * 4;
+    pixels[offset] = b;
+    pixels[offset + 1] = g;
+    pixels[offset + 2] = r;
+    pixels[offset + 3] = 255;
+}
 
 static void NormalizedWgcRoiProjectsDeterministically()
 {
