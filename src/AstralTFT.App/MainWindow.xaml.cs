@@ -198,7 +198,7 @@ public partial class MainWindow : Window, INotifyPropertyChanged
         }
     }
 
-    private static async Task ConsumeFramesAsync(
+    private async Task ConsumeFramesAsync(
         WindowsGraphicsCaptureFrameSource source,
         CaptureBenchmarkRecorder benchmark,
         GridLumaRegionChangeDetector changeDetector,
