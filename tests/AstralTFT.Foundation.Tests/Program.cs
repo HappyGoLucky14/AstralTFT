@@ -1,6 +1,7 @@
 using AstralTFT.Capture.Abstractions;
 using AstralTFT.Capture.Regions;
 using AstralTFT.Capture.Recognition;
+using AstralTFT.Capture.Windows;
 using AstralTFT.Core.Models;
 using AstralTFT.Meta.Ensembling;
 using AstralTFT.Infrastructure.Diagnostics;
@@ -49,7 +50,8 @@ var tests = new (string Name, Action Run)[]
     ("Recognition dispatcher skips stale work", RecognitionDispatcherSkipsStale),
     ("Recognition result gate rejects out-of-order batches", RecognitionResultGateRejectsOld),
     ("Detector registry rejects ambiguous region ownership", DetectorRegistryRejectsDuplicates),
-    ("Frame pump disposes capture lease after ROI routing", FramePumpDisposesCaptureLease)
+    ("Frame pump disposes capture lease after ROI routing", FramePumpDisposesCaptureLease),
+    ("TFT window selector rejects guide/browser false positives", TftWindowSelectorRejectsFalsePositives),
 };
 
 var failures = new List<string>();
@@ -635,6 +637,44 @@ static void True(bool value, string message)
     if (!value) throw new InvalidOperationException(message);
 }
 
+
+static void TftWindowSelectorRejectsFalsePositives()
+{
+    var candidates = new[]
+    {
+        new TftWindowCandidateSelector.Candidate(
+            (nint)1,
+            "firefox",
+            "Blossom Comp Guide [Set 18] | TFT Flow â€” Mozilla Firefox",
+            1920,
+            1040,
+            false),
+
+        new TftWindowCandidateSelector.Candidate(
+            (nint)2,
+            "TFTAcademy",
+            "TFTAcademy",
+            1080,
+            1194,
+            false),
+
+        new TftWindowCandidateSelector.Candidate(
+            (nint)3,
+            "TFTClient-Win64-Shipping",
+            "TFT  ",
+            1920,
+            1080,
+            false)
+    };
+
+    Equal(0, TftWindowCandidateSelector.Score("firefox", "TFT Flow"));
+    Equal(0, TftWindowCandidateSelector.Score("TFTAcademy", "TFTAcademy"));
+
+    var selected = TftWindowCandidateSelector.ChooseBest(candidates);
+    True(selected is not null, "Expected the real TFT client to be selected.");
+    Equal((nint)3, selected!.Window.Hwnd);
+    Equal("TFTClient-Win64-Shipping", selected.Window.ProcessName);
+}
 
 sealed class TrackingDisposable : IDisposable
 {
