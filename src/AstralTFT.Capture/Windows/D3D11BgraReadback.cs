@@ -51,8 +51,10 @@ internal sealed class D3D11BgraReadback : IDisposable
         var sourceBox = new Box(
             region.X,
             region.Y,
+            0,
             region.X + region.Width,
-            region.Y + region.Height);
+            region.Y + region.Height,
+            1);
 
         _context.CopySubresourceRegion(
             _staging!,
