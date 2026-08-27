@@ -1,0 +1,28 @@
+<Application x:Class="AstralTFT.App.App"
+             xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
+             xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
+             StartupUri="MainWindow.xaml">
+    <Application.Resources>
+        <Color x:Key="AstralBg">#FF100D18</Color>
+        <Color x:Key="AstralPanel">#E6191526</Color>
+        <Color x:Key="AstralPanel2">#D9231D34</Color>
+        <Color x:Key="AstralText">#FFF5F1FF</Color>
+        <Color x:Key="AstralMuted">#FFAAA1BD</Color>
+        <Color x:Key="AstralAccent">#FF9B6DFF</Color>
+        <Color x:Key="AstralAccent2">#FF6F5BDD</Color>
+        <Color x:Key="AstralGood">#FF72D9AA</Color>
+
+        <SolidColorBrush x:Key="BgBrush" Color="{StaticResource AstralBg}"/>
+        <SolidColorBrush x:Key="PanelBrush" Color="{StaticResource AstralPanel}"/>
+        <SolidColorBrush x:Key="Panel2Brush" Color="{StaticResource AstralPanel2}"/>
+        <SolidColorBrush x:Key="TextBrush" Color="{StaticResource AstralText}"/>
+        <SolidColorBrush x:Key="MutedBrush" Color="{StaticResource AstralMuted}"/>
+        <SolidColorBrush x:Key="AccentBrush" Color="{StaticResource AstralAccent}"/>
+        <SolidColorBrush x:Key="GoodBrush" Color="{StaticResource AstralGood}"/>
+
+        <Style TargetType="TextBlock">
+            <Setter Property="Foreground" Value="{StaticResource TextBrush}"/>
+            <Setter Property="FontFamily" Value="Segoe UI Variable Text, Segoe UI"/>
+        </Style>
+    </Application.Resources>
+</Application>

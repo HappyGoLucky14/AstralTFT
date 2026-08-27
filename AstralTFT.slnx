@@ -1,0 +1,15 @@
+<Solution>
+  <Folder Name="/src/">
+    <Project Path="src/AstralTFT.Core/AstralTFT.Core.csproj" />
+    <Project Path="src/AstralTFT.State/AstralTFT.State.csproj" />
+    <Project Path="src/AstralTFT.Capture/AstralTFT.Capture.csproj" />
+    <Project Path="src/AstralTFT.Meta/AstralTFT.Meta.csproj" />
+    <Project Path="src/AstralTFT.Analysis/AstralTFT.Analysis.csproj" />
+    <Project Path="src/AstralTFT.Infrastructure/AstralTFT.Infrastructure.csproj" />
+    <Project Path="src/AstralTFT.App/AstralTFT.App.csproj" />
+  </Folder>
+  <Folder Name="/tests/">
+    <Project Path="tests/AstralTFT.State.Tests/AstralTFT.State.Tests.csproj" />
+    <Project Path="tests/AstralTFT.Foundation.Tests/AstralTFT.Foundation.Tests.csproj" />
+  </Folder>
+</Solution>

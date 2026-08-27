@@ -1,0 +1,32 @@
+# .NET
+bin/
+obj/
+artifacts/
+TestResults/
+*.user
+*.suo
+*.userosscache
+*.sln.docstates
+
+# IDE
+.vs/
+.idea/
+.vscode/
+
+# Diagnostics / local runtime outputs
+astraltft-preflight.json
+astraltft-capture-benchmark*.json
+AstralTFT-Diagnostics*.zip
+logs/
+*.log
+
+# Local secrets and machine-specific config
+appsettings.json
+*.secrets.json
+.env
+.env.*
+
+# OS
+Thumbs.db
+Desktop.ini
+.DS_Store

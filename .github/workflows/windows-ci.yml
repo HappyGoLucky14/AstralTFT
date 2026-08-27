@@ -1,0 +1,102 @@
+name: Windows CI
+
+on:
+  push:
+    branches: [ main, develop ]
+  pull_request:
+    branches: [ main, develop ]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: astraltft-windows-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  DOTNET_NOLOGO: true
+  DOTNET_CLI_TELEMETRY_OPTOUT: true
+  NUGET_XMLDOC_MODE: skip
+  CONFIGURATION: Release
+
+jobs:
+  build-test-package:
+    name: Build, test, and package (Windows)
+    runs-on: windows-latest
+    timeout-minutes: 30
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install .NET 10 SDK
+        uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: '10.0.x'
+          cache: true
+          cache-dependency-path: |
+            **/*.csproj
+            Directory.Packages.props
+
+      - name: Show .NET environment
+        shell: pwsh
+        run: dotnet --info
+
+      - name: Restore
+        shell: pwsh
+        run: dotnet restore .\AstralTFT.slnx --locked-mode:$false
+
+      - name: Build with analyzers
+        shell: pwsh
+        run: dotnet build .\AstralTFT.slnx -c $env:CONFIGURATION --no-restore
+
+      - name: State self-tests
+        shell: pwsh
+        run: dotnet run --project .\tests\AstralTFT.State.Tests\AstralTFT.State.Tests.csproj -c $env:CONFIGURATION --no-build
+
+      - name: Foundation and capture self-tests
+        shell: pwsh
+        run: dotnet run --project .\tests\AstralTFT.Foundation.Tests\AstralTFT.Foundation.Tests.csproj -c $env:CONFIGURATION --no-build
+
+      - name: Publish diagnostic app (framework-dependent)
+        shell: pwsh
+        run: |
+          dotnet publish .\src\AstralTFT.App\AstralTFT.App.csproj `
+            -c $env:CONFIGURATION `
+            -r win-x64 `
+            --self-contained false `
+            --no-restore `
+            -o .\artifacts\AstralTFT-win-x64
+
+      - name: Add verification scripts and build metadata
+        shell: pwsh
+        run: |
+          Copy-Item .\verify-windows.ps1 .\artifacts\AstralTFT-win-x64\
+          Copy-Item .\run-capture-benchmark.ps1 .\artifacts\AstralTFT-win-x64\
+          Copy-Item .\scripts-doctor.ps1 .\artifacts\AstralTFT-win-x64\
+          @(
+            "commit=$env:GITHUB_SHA"
+            "run_id=$env:GITHUB_RUN_ID"
+            "run_number=$env:GITHUB_RUN_NUMBER"
+            "built_utc=$([DateTime]::UtcNow.ToString('o'))"
+          ) | Set-Content .\artifacts\AstralTFT-win-x64\build-info.txt
+
+      - name: Generate SHA-256 manifest
+        shell: pwsh
+        run: |
+          Get-ChildItem .\artifacts\AstralTFT-win-x64 -File -Recurse |
+            Sort-Object FullName |
+            ForEach-Object {
+              $hash = Get-FileHash $_.FullName -Algorithm SHA256
+              $relative = [IO.Path]::GetRelativePath((Resolve-Path .\artifacts\AstralTFT-win-x64), $_.FullName)
+              "$($hash.Hash.ToLowerInvariant())  $relative"
+            } | Set-Content .\artifacts\AstralTFT-win-x64\SHA256SUMS.txt
+
+      - name: Upload Windows diagnostic build
+        uses: actions/upload-artifact@v4
+        with:
+          name: AstralTFT-win-x64-${{ github.run_number }}
+          path: artifacts/AstralTFT-win-x64/**
+          if-no-files-found: error
+          retention-days: 14

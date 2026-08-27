@@ -1,0 +1,14 @@
+<Project Sdk="Microsoft.NET.Sdk">
+  <PropertyGroup>
+    <TargetFramework>net10.0</TargetFramework>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <Nullable>enable</Nullable>
+    <LangVersion>14.0</LangVersion>
+  </PropertyGroup>
+  <ItemGroup>
+    <ProjectReference Include="..\AstralTFT.Core\AstralTFT.Core.csproj" />
+    <ProjectReference Include="..\AstralTFT.State\AstralTFT.State.csproj" />
+    <ProjectReference Include="..\AstralTFT.Meta\AstralTFT.Meta.csproj" />
+  </ItemGroup>
+  <!-- Pin package versions after the first Windows benchmark/build pass. -->
+</Project>

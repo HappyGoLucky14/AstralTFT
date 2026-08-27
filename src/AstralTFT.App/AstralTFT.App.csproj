@@ -1,0 +1,19 @@
+<Project Sdk="Microsoft.NET.Sdk">
+  <PropertyGroup>
+    <OutputType>WinExe</OutputType>
+    <TargetFramework>net10.0-windows10.0.26100.0</TargetFramework>
+    <SupportedOSPlatformVersion>10.0.19041.0</SupportedOSPlatformVersion>
+    <UseWPF>true</UseWPF>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <Nullable>enable</Nullable>
+    <LangVersion>14.0</LangVersion>
+  </PropertyGroup>
+  <ItemGroup>
+    <ProjectReference Include="..\AstralTFT.Core\AstralTFT.Core.csproj" />
+    <ProjectReference Include="..\AstralTFT.State\AstralTFT.State.csproj" />
+    <ProjectReference Include="..\AstralTFT.Capture\AstralTFT.Capture.csproj" />
+    <ProjectReference Include="..\AstralTFT.Analysis\AstralTFT.Analysis.csproj" />
+    <ProjectReference Include="..\AstralTFT.Meta\AstralTFT.Meta.csproj" />
+    <ProjectReference Include="..\AstralTFT.Infrastructure\AstralTFT.Infrastructure.csproj" />
+  </ItemGroup>
+</Project>
