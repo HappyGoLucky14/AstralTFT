@@ -45,7 +45,7 @@ jobs:
 
       - name: Restore
         shell: pwsh
-        run: dotnet restore .\AstralTFT.slnx --locked-mode:$false
+        run: dotnet restore .\AstralTFT.slnx
 
       - name: Build with analyzers
         shell: pwsh
@@ -100,3 +100,4 @@ jobs:
           path: artifacts/AstralTFT-win-x64/**
           if-no-files-found: error
           retention-days: 14
+
