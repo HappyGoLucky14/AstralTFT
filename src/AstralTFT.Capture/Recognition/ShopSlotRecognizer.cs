@@ -196,37 +196,37 @@ public sealed class ShopSlotRecognizer
 
     private static int InferCostTier(Bgra32FrameBuffer buffer, RegionOfInterest region)
     {
-        // Sample the relatively uniform lower name-bar background while rejecting
-        // bright glyphs/cost icons. Median RGB is robust against the champion name.
-        Span<int> reds = stackalloc int[18];
-        Span<int> greens = stackalloc int[18];
-        Span<int> blues = stackalloc int[18];
+        // The Set 18 cost color is the dominant background of the lower name bar.
+        // The previous sparse-point sampler could land on champion-name glyphs, the
+        // coin/cost icon, or decorative pixels and occasionally turn a 5-cost into
+        // a 4- or 1-cost. Use the whole lower band and take a robust channel median
+        // after rejecting near-black borders and bright foreground glyphs.
+        const int maxSamples = 1024;
+        Span<int> reds = stackalloc int[maxSamples];
+        Span<int> greens = stackalloc int[maxSamples];
+        Span<int> blues = stackalloc int[maxSamples];
         var count = 0;
-
-        ReadOnlySpan<double> yFractions = [0.84, 0.88, 0.92];
-        ReadOnlySpan<double> xFractions = [0.12, 0.25, 0.40, 0.55, 0.70, 0.85];
         var pixels = buffer.Pixels.Span;
 
-        foreach (var yf in yFractions)
-        {
-            foreach (var xf in xFractions)
-            {
-                var x = Math.Clamp(
-                    region.X + (int)Math.Round(region.Width * xf),
-                    region.X,
-                    region.X + region.Width - 1);
-                var y = Math.Clamp(
-                    region.Y + (int)Math.Round(region.Height * yf),
-                    region.Y,
-                    region.Y + region.Height - 1);
+        var x0 = region.X + Math.Max(1, (int)Math.Round(region.Width * 0.02));
+        var x1 = region.X + Math.Max(2, (int)Math.Round(region.Width * 0.98));
+        var y0 = region.Y + Math.Max(1, (int)Math.Round(region.Height * 0.84));
+        var y1 = region.Y + Math.Max(2, (int)Math.Round(region.Height * 0.98));
 
+        x1 = Math.Clamp(x1, x0 + 1, region.X + region.Width);
+        y1 = Math.Clamp(y1, y0 + 1, region.Y + region.Height);
+
+        for (var y = y0; y < y1 && count < maxSamples; y += 2)
+        {
+            for (var x = x0; x < x1 && count < maxSamples; x += 2)
+            {
                 var offset = checked(y * buffer.Stride + x * 4);
                 var b = pixels[offset];
                 var g = pixels[offset + 1];
                 var r = pixels[offset + 2];
                 var max = Math.Max(r, Math.Max(g, b));
 
-                if (max is <= 8 or >= 130)
+                if (max < 10 || max > 160)
                     continue;
 
                 reds[count] = r;
@@ -236,7 +236,7 @@ public sealed class ShopSlotRecognizer
             }
         }
 
-        if (count < 3)
+        if (count < 12)
             return 0;
 
         reds[..count].Sort();
@@ -248,25 +248,26 @@ public sealed class ShopSlotRecognizer
         var bMedian = Median(blues[..count]);
         var (hue, saturation, _) = ToHsv(rMedian, gMedian, bMedian);
 
-        if (hue is >= 125 and <= 190 && saturation >= 0.15)
+        if (hue is >= 125 and <= 190 && saturation >= 0.20)
             return 2;
 
-        if (hue is >= 205 and <= 260)
+        if (hue is >= 195 and <= 260)
         {
-            // The 1-cost bar is a dark desaturated blue-grey; 3-cost is a much
-            // stronger blue. This split was validated against the Set 18 HUD.
-            if (bMedian >= 55 && bMedian - rMedian >= 25)
+            if (bMedian >= 60 && bMedian - rMedian >= 28)
                 return 3;
             return 1;
         }
 
-        if (hue is > 260 and <= 335 && saturation >= 0.15)
+        if (hue is > 260 and <= 340 && saturation >= 0.18)
             return 4;
 
-        if (hue is >= 20 and <= 80 && saturation >= 0.15)
+        if ((hue is >= 15 and <= 90 && saturation >= 0.18) ||
+            (rMedian > gMedian && gMedian > bMedian && rMedian - bMedian >= 18))
+        {
             return 5;
+        }
 
-        return 1;
+        return 0;
     }
 
     private static ulong ComputeAverageHash(Bgra32FrameBuffer buffer, RegionOfInterest region)

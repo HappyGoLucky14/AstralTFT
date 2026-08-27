@@ -55,6 +55,7 @@ var tests = new (string Name, Action Run)[]
     ("TFT window selector rejects guide/browser false positives", TftWindowSelectorRejectsFalsePositives),
     ("Normalized WGC ROI projects deterministically", NormalizedWgcRoiProjectsDeterministically),
     ("Shop structure recognizer finds empty and cost tiers", ShopStructureRecognition),
+    ("Shop cost bar median resists glyph noise", ShopCostBarMedianResistsGlyphNoise),
 };
 
 var failures = new List<string>();
@@ -750,6 +751,58 @@ static void SetBgra(byte[] pixels, int stride, int x, int y, byte r, byte g, byt
     pixels[offset + 1] = g;
     pixels[offset + 2] = r;
     pixels[offset + 3] = 255;
+}
+
+
+static void ShopCostBarMedianResistsGlyphNoise()
+{
+    const int width = 1152;
+    const int height = 239;
+    const int stride = width * 4;
+    var pixels = new byte[stride * height];
+    FillBgra(pixels, stride, 0, 0, width, height, 12, 12, 6);
+
+    var slots = ShopSlotRecognizer.ProjectSlots(width, height);
+
+    PaintSyntheticShopUnit(pixels, stride, slots[0], 24, 38, 50);  // 1-cost
+    PaintSyntheticShopUnit(pixels, stride, slots[1], 96, 67, 24);  // 5-cost
+    PaintSyntheticShopUnit(pixels, stride, slots[2], 28, 39, 75);  // 3-cost
+    PaintSyntheticShopUnit(pixels, stride, slots[3], 76, 31, 86);  // 4-cost
+    PaintSyntheticShopUnit(pixels, stride, slots[4], 104, 72, 25); // 5-cost
+
+    PaintSparseNoise(pixels, stride, slots[1], 82, 28, 92);
+    PaintSparseNoise(pixels, stride, slots[4], 23, 37, 50);
+
+    var recognizer = new ShopSlotRecognizer();
+    var result = recognizer.Recognize(new Bgra32FrameBuffer(width, height, stride, pixels));
+
+    Equal(1, result.Slots[0].CostTier);
+    Equal(5, result.Slots[1].CostTier);
+    Equal(3, result.Slots[2].CostTier);
+    Equal(4, result.Slots[3].CostTier);
+    Equal(5, result.Slots[4].CostTier);
+}
+
+static void PaintSparseNoise(
+    byte[] pixels,
+    int stride,
+    RegionOfInterest slot,
+    byte r,
+    byte g,
+    byte b)
+{
+    ReadOnlySpan<double> xFractions = [0.12, 0.25, 0.40, 0.55, 0.70, 0.85];
+    ReadOnlySpan<double> yFractions = [0.86, 0.90, 0.94];
+
+    foreach (var yf in yFractions)
+    {
+        foreach (var xf in xFractions)
+        {
+            var x = Math.Clamp(slot.X + (int)Math.Round(slot.Width * xf), slot.X, slot.X + slot.Width - 1);
+            var y = Math.Clamp(slot.Y + (int)Math.Round(slot.Height * yf), slot.Y, slot.Y + slot.Height - 1);
+            SetBgra(pixels, stride, x, y, r, g, b);
+        }
+    }
 }
 
 static void NormalizedWgcRoiProjectsDeterministically()
