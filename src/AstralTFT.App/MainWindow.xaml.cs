@@ -242,7 +242,7 @@ public partial class MainWindow : Window, INotifyPropertyChanged
                 ? "warming up"
                 : $"{telemetry.LastReadbackDuration.TotalMilliseconds:F2} ms • {telemetry.ReadbackWidth}×{telemetry.ReadbackHeight}";
             DropText = $"{telemetry.FramesDroppedWhileBusy} busy • {telemetry.FramesDroppedByBackPressure} stale • {telemetry.FramesDroppedByThrottle} throttled";
-            CaptureDetails = $"ROI {telemetry.ReadbackRegionId} • {megabytesPerSecond:F1} MB/s CPU copy • Arrived {telemetry.FramesArrived:N0} • Read back {telemetry.FramesReadBack:N0} • Errors {telemetry.CaptureErrors} • source {telemetry.Width}×{telemetry.Height}";
+            CaptureDetails = $"ROI {telemetry.ReadbackRegionId} • {megabytesPerSecond:F1} MB/s CPU copy • Arrived {telemetry.FramesArrived:N0} • Read back {telemetry.FramesReadBack:N0} • telemetry {telemetry.TelemetryEventsEmitted:N0} • Errors {telemetry.CaptureErrors} • source {telemetry.Width}×{telemetry.Height}";
 
             if (telemetry.CaptureErrors > 0)
             {

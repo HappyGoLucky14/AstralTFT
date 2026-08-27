@@ -16,6 +16,7 @@ public sealed record WgcCaptureTelemetry(
     long FramesDroppedByBackPressure,
     long ResizeEvents,
     long CaptureErrors,
+    long TelemetryEventsEmitted,
     long BytesReadBack,
     int Width,
     int Height,
@@ -70,6 +71,7 @@ public sealed class WindowsGraphicsCaptureFrameSource : IFrameSource
     private long _framesDroppedByBackPressure;
     private long _resizeEvents;
     private long _captureErrors;
+    private long _telemetryEventsEmitted;
     private long _bytesReadBack;
     private int _lastReadbackWidth;
     private int _lastReadbackHeight;
@@ -101,6 +103,7 @@ public sealed class WindowsGraphicsCaptureFrameSource : IFrameSource
         Interlocked.Read(ref _framesDroppedByBackPressure),
         Interlocked.Read(ref _resizeEvents),
         Interlocked.Read(ref _captureErrors),
+        Interlocked.Read(ref _telemetryEventsEmitted),
         Interlocked.Read(ref _bytesReadBack),
         _poolSize.Width,
         _poolSize.Height,
@@ -214,6 +217,7 @@ public sealed class WindowsGraphicsCaptureFrameSource : IFrameSource
 
         }
 
+        var shouldEmitTelemetry = false;
         try
         {
             SizeInt32? recreate = null;
@@ -252,6 +256,7 @@ public sealed class WindowsGraphicsCaptureFrameSource : IFrameSource
                 Interlocked.Add(ref _bytesReadBack, cpu.Buffer.RequiredByteLength);
                 Volatile.Write(ref _lastReadbackWidth, cpu.Buffer.Width);
                 Volatile.Write(ref _lastReadbackHeight, cpu.Buffer.Height);
+                shouldEmitTelemetry = true;
 
                 var captured = new CapturedFrame(
                     Interlocked.Increment(ref _sequence),
@@ -268,11 +273,15 @@ public sealed class WindowsGraphicsCaptureFrameSource : IFrameSource
             {
                 frame.Dispose();
                 if (recreate is { } requestedSize && Volatile.Read(ref _stopping) == 0)
+                {
                     RecreateFramePool(requestedSize);
+                    shouldEmitTelemetry = true;
+                }
             }
         }
         catch (Exception ex)
         {
+            shouldEmitTelemetry = true;
             Interlocked.Increment(ref _captureErrors);
             try { CaptureFaulted?.Invoke(this, ex); } catch { }
 
@@ -282,7 +291,8 @@ public sealed class WindowsGraphicsCaptureFrameSource : IFrameSource
         finally
         {
             Volatile.Write(ref _processingFrame, 0);
-            EmitTelemetry();
+            if (shouldEmitTelemetry)
+                EmitTelemetry();
         }
     }
 
@@ -461,6 +471,7 @@ public sealed class WindowsGraphicsCaptureFrameSource : IFrameSource
 
     private void EmitTelemetry()
     {
+        Interlocked.Increment(ref _telemetryEventsEmitted);
         try { TelemetryUpdated?.Invoke(this, Telemetry); } catch { }
     }
 }

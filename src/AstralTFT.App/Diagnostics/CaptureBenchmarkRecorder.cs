@@ -98,7 +98,7 @@ internal sealed class CaptureBenchmarkRecorder
         var duration = endedAt - _startedAt;
 
         return new CaptureBenchmarkReport(
-            SchemaVersion: 2,
+            SchemaVersion: 3,
             AppVersion: Assembly.GetExecutingAssembly().GetName().Version?.ToString() ?? "dev",
             StartedAtUtc: _startedAt,
             EndedAtUtc: endedAt,
@@ -126,17 +126,25 @@ internal sealed class CaptureBenchmarkRecorder
                 P95Ms: Percentile(readbacks, 0.95),
                 P99Ms: Percentile(readbacks, 0.99),
                 MaxMs: readbacks.Length == 0 ? 0 : readbacks[^1]),
-            Process: new ProcessStatistics(
-                SampleCount: process.Length,
-                AverageCpuPercent: process.Length == 0 ? 0 : process.Average(x => x.CpuPercent),
-                P95CpuPercent: Percentile(process.Select(x => x.CpuPercent).Order().ToArray(), 0.95),
-                MaxCpuPercent: process.Length == 0 ? 0 : process.Max(x => x.CpuPercent),
-                AverageWorkingSetMb: process.Length == 0 ? 0 : process.Average(x => x.WorkingSetBytes) / 1024d / 1024d,
-                MaxWorkingSetMb: process.Length == 0 ? 0 : process.Max(x => x.WorkingSetBytes) / 1024d / 1024d,
-                AverageManagedHeapMb: process.Length == 0 ? 0 : process.Average(x => x.ManagedHeapBytes) / 1024d / 1024d,
-                MaxManagedHeapMb: process.Length == 0 ? 0 : process.Max(x => x.ManagedHeapBytes) / 1024d / 1024d),
+            Process: BuildProcessStatistics(process),
+            SteadyStateProcess: BuildProcessStatistics(
+                process.Where(x => x.AtUtc - _startedAt >= TimeSpan.FromSeconds(15)).ToArray()),
+            SteadyStateWarmupExcludedSeconds: 15,
             Samples: process,
             Privacy: "AstralTFT process metrics + TFT window metadata only; no TFT process memory is read.");
+    }
+
+    private static ProcessStatistics BuildProcessStatistics(ProcessMetricSample[] process)
+    {
+        return new ProcessStatistics(
+            SampleCount: process.Length,
+            AverageCpuPercent: process.Length == 0 ? 0 : process.Average(x => x.CpuPercent),
+            P95CpuPercent: Percentile(process.Select(x => x.CpuPercent).Order().ToArray(), 0.95),
+            MaxCpuPercent: process.Length == 0 ? 0 : process.Max(x => x.CpuPercent),
+            AverageWorkingSetMb: process.Length == 0 ? 0 : process.Average(x => x.WorkingSetBytes) / 1024d / 1024d,
+            MaxWorkingSetMb: process.Length == 0 ? 0 : process.Max(x => x.WorkingSetBytes) / 1024d / 1024d,
+            AverageManagedHeapMb: process.Length == 0 ? 0 : process.Average(x => x.ManagedHeapBytes) / 1024d / 1024d,
+            MaxManagedHeapMb: process.Length == 0 ? 0 : process.Max(x => x.ManagedHeapBytes) / 1024d / 1024d);
     }
 
     private async Task<string?> WriteReportAsync(CaptureBenchmarkReport report)
@@ -221,6 +229,8 @@ internal sealed class CaptureBenchmarkRecorder
         WgcCaptureTelemetry? Capture,
         ReadbackStatistics Readback,
         ProcessStatistics Process,
+        ProcessStatistics SteadyStateProcess,
+        int SteadyStateWarmupExcludedSeconds,
         IReadOnlyList<ProcessMetricSample> Samples,
         string Privacy);
 
