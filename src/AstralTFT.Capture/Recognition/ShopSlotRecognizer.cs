@@ -19,6 +19,7 @@ public sealed record ShopSlotReading(
 
 public sealed record ShopHudObservation(
     bool IsVisible,
+    bool SupportsHold,
     double Confidence,
     int TopBorderMatches,
     int SeparatorMatches);
@@ -102,7 +103,7 @@ public sealed class ShopSlotRecognizer
                 region.Width,
                 stripBottom - stripTop);
 
-            if (ratio >= 0.28)
+            if (ratio >= 0.24)
                 topBorderMatches++;
         }
 
@@ -130,7 +131,7 @@ public sealed class ShopSlotRecognizer
                 gapRight - gapLeft,
                 stripBottom - stripTop);
 
-            if (ratio >= 0.18)
+            if (ratio >= 0.14)
                 separatorMatches++;
         }
 
@@ -141,10 +142,19 @@ public sealed class ShopSlotRecognizer
         var isVisible =
             topBorderMatches >= 4 &&
             separatorMatches >= 3 &&
-            confidence >= 0.75;
+            confidence >= 0.70;
+
+        // Once a real shop has been confirmed, muted/greyed card states and short
+        // round-transition effects are allowed to keep the HUD alive without
+        // authorizing a fresh slot read. This is deliberately weaker than the
+        // initial activation threshold and is only used as temporal hysteresis.
+        var supportsHold =
+            (topBorderMatches >= 3 && separatorMatches >= 2 && confidence >= 0.50) ||
+            (topBorderMatches >= 4 && separatorMatches >= 1 && confidence >= 0.48);
 
         return new ShopHudObservation(
             IsVisible: isVisible,
+            SupportsHold: supportsHold,
             Confidence: confidence,
             TopBorderMatches: topBorderMatches,
             SeparatorMatches: separatorMatches);
@@ -199,15 +209,27 @@ public sealed class ShopSlotRecognizer
                 var r = pixels[offset + 2];
                 var max = Math.Max(r, Math.Max(g, b));
 
-                if (max <= 80 &&
-                    r <= 55 &&
-                    g >= r &&
-                    b >= r &&
-                    g - r >= 2 &&
-                    b - r >= 2)
-                {
+                var min = Math.Min(r, Math.Min(g, b));
+                var chroma = max - min;
+                var luma = r * 0.2126 + g * 0.7152 + b * 0.0722;
+
+                // Normal shop chrome is dark blue/cyan, but TFT can desaturate the
+                // entire shop when the player cannot afford a unit. Accept both the
+                // normal chromatic frame and its dark neutral/greyed equivalent.
+                var darkCyanFrame =
+                    max <= 92 &&
+                    r <= 68 &&
+                    g >= r - 3 &&
+                    b >= r - 3 &&
+                    (g - r >= 1 || b - r >= 1);
+
+                var darkNeutralFrame =
+                    luma <= 72 &&
+                    max <= 86 &&
+                    chroma <= 22;
+
+                if (darkCyanFrame || darkNeutralFrame)
                     matches++;
-                }
 
                 count++;
             }

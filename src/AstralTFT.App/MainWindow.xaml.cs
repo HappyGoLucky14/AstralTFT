@@ -32,9 +32,13 @@ public partial class MainWindow : Window, INotifyPropertyChanged
     private readonly TftWindowLocator _locator = new();
     private readonly ShopSlotRecognizer _shopRecognizer = new();
     private readonly CancellationTokenSource _shutdown = new();
+    private const int ShopHudConfirmFrames = 3;
+    private const int ShopHudDropFrames = 20;
+
     private int _shopHudConfirmationFrames;
     private int _shopHudMissingFrames;
     private bool _shopHudConfirmed;
+    private string _lastConfirmedShopSummary = "No confirmed shop yet.";
     private WindowsGraphicsCaptureFrameSource? _captureSource;
     private Task? _captureTask;
     private CancellationTokenSource? _captureSamplerCts;
@@ -251,12 +255,21 @@ public partial class MainWindow : Window, INotifyPropertyChanged
                             if (!_shopHudConfirmed)
                             {
                                 _shopHudConfirmationFrames++;
-                                if (_shopHudConfirmationFrames >= 3)
+                                if (_shopHudConfirmationFrames >= ShopHudConfirmFrames)
                                 {
                                     _shopHudConfirmed = true;
                                     justConfirmed = true;
                                 }
                             }
+                        }
+                        else if (_shopHudConfirmed && hud.SupportsHold)
+                        {
+                            // Greyed unaffordable units and short HUD animation states
+                            // may weaken the exact frame colors without removing the
+                            // underlying shop. Keep the last confirmed result, but do
+                            // not run a fresh classification from the muted frame.
+                            _shopHudConfirmationFrames = 0;
+                            _shopHudMissingFrames = 0;
                         }
                         else
                         {
@@ -265,7 +278,7 @@ public partial class MainWindow : Window, INotifyPropertyChanged
                             if (_shopHudConfirmed)
                             {
                                 _shopHudMissingFrames++;
-                                if (_shopHudMissingFrames >= 2)
+                                if (_shopHudMissingFrames >= ShopHudDropFrames)
                                 {
                                     _shopHudConfirmed = false;
                                     _shopHudMissingFrames = 0;
@@ -292,6 +305,7 @@ public partial class MainWindow : Window, INotifyPropertyChanged
                             var summary = string.Join(
                                 "  •  ",
                                 shop.Slots.Select(FormatShopSlot));
+                            _lastConfirmedShopSummary = summary;
 
                             await Dispatcher.InvokeAsync(() =>
                             {
@@ -301,9 +315,21 @@ public partial class MainWindow : Window, INotifyPropertyChanged
                                     $"Shop HUD confirmed ({shop.Hud.TopBorderMatches}/5 top, {shop.Hud.SeparatorMatches}/4 separators) • structural recognition {shop.ProcessingTime.TotalMicroseconds:F1} µs.";
                             });
                         }
+                        else if (_shopHudConfirmed && !hud.IsVisible)
+                        {
+                            var remaining = Math.Max(0, ShopHudDropFrames - _shopHudMissingFrames);
+                            await Dispatcher.InvokeAsync(() =>
+                            {
+                                RecognitionState = "HOLD";
+                                RecognitionDetails =
+                                    $"{_lastConfirmedShopSummary}  •  temporarily holding ({remaining} grace frames)";
+                                FooterText =
+                                    $"Shop chrome is muted/transitioning • anchors {hud.TopBorderMatches}/5 top, {hud.SeparatorMatches}/4 separators • no new shop guess is being made.";
+                            });
+                        }
                         else if (!_shopHudConfirmed)
                         {
-                            var progress = Math.Clamp(_shopHudConfirmationFrames, 0, 3);
+                            var progress = Math.Clamp(_shopHudConfirmationFrames, 0, ShopHudConfirmFrames);
                             await Dispatcher.InvokeAsync(() =>
                             {
                                 RecognitionState = "WAITING";

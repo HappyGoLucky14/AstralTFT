@@ -58,6 +58,7 @@ var tests = new (string Name, Action Run)[]
     ("Shop cost bar median resists glyph noise", ShopCostBarMedianResistsGlyphNoise),
     ("Shop HUD gate rejects incomplete false positives", ShopHudGateRejectsIncompleteFalsePositives),
     ("Shop HUD requires repeated frame anchors", ShopHudRequiresFrameAnchors),
+    ("Shop HUD accepts greyed unaffordable chrome", ShopHudAcceptsGreyedChrome),
 };
 
 var failures = new List<string>();
@@ -922,6 +923,60 @@ static void PaintSyntheticShopHudFrame(
             22,
             24);
     }
+}
+
+
+static void ShopHudAcceptsGreyedChrome()
+{
+    const int width = 1152;
+    const int height = 239;
+    const int stride = width * 4;
+    var pixels = new byte[stride * height];
+    FillBgra(pixels, stride, 0, 0, width, height, 18, 18, 18);
+
+    var slots = ShopSlotRecognizer.ProjectSlots(width, height);
+
+    // Draw the same repeated shop frame in a fully desaturated dark grey,
+    // modelling TFT's unaffordable/temporarily muted visual state.
+    foreach (var slot in slots)
+    {
+        FillBgra(
+            pixels,
+            stride,
+            slot.X,
+            Math.Max(0, slot.Y - 2),
+            slot.Width,
+            7,
+            34,
+            34,
+            34);
+    }
+
+    for (var i = 0; i < slots.Count - 1; i++)
+    {
+        var left = slots[i];
+        var right = slots[i + 1];
+        var gapX = left.X + left.Width;
+        var gapWidth = Math.Max(1, right.X - gapX);
+        var top = Math.Max(left.Y, right.Y) + 8;
+        var bottom = Math.Min(left.Y + left.Height, right.Y + right.Height) - 8;
+
+        FillBgra(
+            pixels,
+            stride,
+            gapX,
+            top,
+            gapWidth,
+            Math.Max(1, bottom - top),
+            32,
+            32,
+            32);
+    }
+
+    var recognizer = new ShopSlotRecognizer();
+    var hud = recognizer.CheckHud(new Bgra32FrameBuffer(width, height, stride, pixels));
+
+    True(hud.IsVisible || hud.SupportsHold, "Greyed shop chrome must remain recognizable as shop HUD evidence.");
 }
 
 static void NormalizedWgcRoiProjectsDeterministically()
