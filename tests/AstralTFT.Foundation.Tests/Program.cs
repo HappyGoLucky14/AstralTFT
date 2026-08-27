@@ -67,6 +67,10 @@ var tests = new (string Name, Action Run)[]
     ("Shop HUD accepts calibrated frame coverage", ShopHudAcceptsCalibratedFrameCoverage),
     ("Corpus hash is deterministic and geometry-sensitive", CorpusHashIsDeterministic),
     ("Corpus contracts reject unsafe geometry", CorpusContractsRejectUnsafeGeometry),
+    ("Corpus store replays exact snapshots in order", CorpusRoundTripsInOrder),
+    ("Corpus store deduplicates blobs", CorpusStoreDeduplicatesBlobs),
+    ("Corpus reader rejects hash mismatch", CorpusReaderRejectsHashMismatch),
+    ("Corpus reader ignores only incomplete final line", CorpusReaderIgnoresIncompleteTail),
 };
 
 var failures = new List<string>();
@@ -697,6 +701,136 @@ static void CorpusContractsRejectUnsafeGeometry()
     Throws<ArgumentException>(() => RegionCorpusHasher.ComputeHash(2, 1, 8, new byte[7]));
 }
 
+static void CorpusRoundTripsInOrder()
+{
+    using var temporary = new TemporaryDirectory();
+    var store = new RegionCorpusStore(temporary.Path, "foundation-tests");
+    var firstCapturedAt = new DateTimeOffset(2026, 8, 28, 12, 0, 0, TimeSpan.Zero);
+    var secondCapturedAt = firstCapturedAt.AddMilliseconds(17);
+    byte[] firstPixels = [1, 2, 3, 255, 4, 5, 6, 255];
+    byte[] secondPixels = [7, 8, 9, 255, 10, 11, 12, 255];
+
+    store.WriteAsync(new RegionCorpusWriteRequest(
+        "shop-slot-1", 101, firstCapturedAt, 2, 1, 8, firstPixels, RegionCorpusSourceKind.LiveCapture))
+        .AsTask().GetAwaiter().GetResult();
+    store.WriteAsync(new RegionCorpusWriteRequest(
+        "shop-slot-2", 102, secondCapturedAt, 2, 1, 8, secondPixels, RegionCorpusSourceKind.ImportedFrame))
+        .AsTask().GetAwaiter().GetResult();
+
+    var snapshots = ReadCorpusAsync(new RegionCorpusReader(temporary.Path)).GetAwaiter().GetResult();
+    try
+    {
+        Equal(2, snapshots.Count);
+        AssertSnapshot(snapshots[0], "shop-slot-1", 101, firstCapturedAt, firstPixels);
+        AssertSnapshot(snapshots[1], "shop-slot-2", 102, secondCapturedAt, secondPixels);
+    }
+    finally
+    {
+        foreach (var snapshot in snapshots)
+            snapshot.Dispose();
+    }
+}
+
+static void CorpusStoreDeduplicatesBlobs()
+{
+    using var temporary = new TemporaryDirectory();
+    var store = new RegionCorpusStore(temporary.Path, "foundation-tests");
+    byte[] pixels = [1, 2, 3, 255, 4, 5, 6, 255];
+    var capturedAt = new DateTimeOffset(2026, 8, 28, 12, 0, 0, TimeSpan.Zero);
+
+    var first = store.WriteAsync(new RegionCorpusWriteRequest(
+        "shop-slot-1", 101, capturedAt, 2, 1, 8, pixels, RegionCorpusSourceKind.LiveCapture))
+        .AsTask().GetAwaiter().GetResult();
+    var second = store.WriteAsync(new RegionCorpusWriteRequest(
+        "shop-slot-2", 102, capturedAt.AddMilliseconds(1), 2, 1, 8, pixels, RegionCorpusSourceKind.LiveCapture))
+        .AsTask().GetAwaiter().GetResult();
+
+    True(first.BlobCreated, "First write should create the content blob.");
+    True(!second.BlobCreated, "Second write with identical pixels should reuse the content blob.");
+    Equal(first.ContentHash, second.ContentHash);
+    Equal(2, File.ReadLines(Path.Combine(temporary.Path, "observations.jsonl")).Count());
+    Equal(1, Directory.EnumerateFiles(Path.Combine(temporary.Path, "blobs"), "*.bgra").Count());
+}
+
+static void CorpusReaderRejectsHashMismatch()
+{
+    using var temporary = new TemporaryDirectory();
+    var store = new RegionCorpusStore(temporary.Path, "foundation-tests");
+    byte[] pixels = [1, 2, 3, 255, 4, 5, 6, 255];
+    var result = store.WriteAsync(new RegionCorpusWriteRequest(
+        "shop-slot-1", 101, new DateTimeOffset(2026, 8, 28, 12, 0, 0, TimeSpan.Zero),
+        2, 1, 8, pixels, RegionCorpusSourceKind.LiveCapture)).AsTask().GetAwaiter().GetResult();
+    var blobPath = Path.Combine(temporary.Path, "blobs", result.ContentHash + ".bgra");
+    var corrupt = File.ReadAllBytes(blobPath);
+    corrupt[0] = 99;
+    File.WriteAllBytes(blobPath, corrupt);
+
+    Throws<InvalidDataException>(() => ReadCorpusAsync(new RegionCorpusReader(temporary.Path)).GetAwaiter().GetResult());
+}
+
+static void CorpusReaderIgnoresIncompleteTail()
+{
+    using var temporary = new TemporaryDirectory();
+    var store = new RegionCorpusStore(temporary.Path, "foundation-tests");
+    byte[] firstPixels = [1, 2, 3, 255, 4, 5, 6, 255];
+    var capturedAt = new DateTimeOffset(2026, 8, 28, 12, 0, 0, TimeSpan.Zero);
+    store.WriteAsync(new RegionCorpusWriteRequest(
+        "shop-slot-1", 101, capturedAt, 2, 1, 8, firstPixels, RegionCorpusSourceKind.LiveCapture))
+        .AsTask().GetAwaiter().GetResult();
+    File.AppendAllText(Path.Combine(temporary.Path, "observations.jsonl"), "{\"schemaVersion\":");
+
+    var reader = new RegionCorpusReader(temporary.Path);
+    var snapshots = ReadCorpusAsync(reader).GetAwaiter().GetResult();
+    try
+    {
+        Equal(1, snapshots.Count);
+        AssertSnapshot(snapshots[0], "shop-slot-1", 101, capturedAt, firstPixels);
+        Equal(1, reader.IgnoredIncompleteTailCount);
+    }
+    finally
+    {
+        foreach (var snapshot in snapshots)
+            snapshot.Dispose();
+    }
+
+    using var malformedTemporary = new TemporaryDirectory();
+    var malformedStore = new RegionCorpusStore(malformedTemporary.Path, "foundation-tests");
+    malformedStore.WriteAsync(new RegionCorpusWriteRequest(
+        "shop-slot-1", 201, capturedAt, 2, 1, 8, firstPixels, RegionCorpusSourceKind.LiveCapture))
+        .AsTask().GetAwaiter().GetResult();
+    File.AppendAllText(Path.Combine(malformedTemporary.Path, "observations.jsonl"), "{not-json}\n");
+    malformedStore.WriteAsync(new RegionCorpusWriteRequest(
+        "shop-slot-2", 202, capturedAt.AddMilliseconds(1), 2, 1, 8,
+        [7, 8, 9, 255, 10, 11, 12, 255], RegionCorpusSourceKind.LiveCapture))
+        .AsTask().GetAwaiter().GetResult();
+
+    Throws<InvalidDataException>(() => ReadCorpusAsync(new RegionCorpusReader(malformedTemporary.Path)).GetAwaiter().GetResult());
+}
+
+static async Task<List<Bgra32RegionSnapshot>> ReadCorpusAsync(RegionCorpusReader reader)
+{
+    var snapshots = new List<Bgra32RegionSnapshot>();
+    await foreach (var snapshot in reader.ReadAsync())
+        snapshots.Add(snapshot);
+    return snapshots;
+}
+
+static void AssertSnapshot(
+    Bgra32RegionSnapshot snapshot,
+    string expectedRegionId,
+    long expectedSequence,
+    DateTimeOffset expectedCapturedAt,
+    byte[] expectedPixels)
+{
+    Equal(expectedRegionId, snapshot.RegionId);
+    Equal(expectedSequence, snapshot.FrameSequence);
+    Equal(expectedCapturedAt, snapshot.CapturedAt);
+    Equal(2, snapshot.Width);
+    Equal(1, snapshot.Height);
+    Equal(8, snapshot.Stride);
+    True(snapshot.Pixels.Span.SequenceEqual(expectedPixels), "Snapshot pixels should replay exactly.");
+}
+
 
 
 static void ShopStructureRecognition()
@@ -1233,6 +1367,23 @@ static void TftWindowSelectorRejectsFalsePositives()
     True(selected is not null, "Expected the real TFT client to be selected.");
     Equal((nint)3, selected!.Window.Hwnd);
     Equal("TFTClient-Win64-Shipping", selected.Window.ProcessName);
+}
+
+sealed class TemporaryDirectory : IDisposable
+{
+    public TemporaryDirectory()
+    {
+        Path = System.IO.Path.Combine(System.IO.Path.GetTempPath(), "astraltft-foundation-" + Guid.NewGuid().ToString("N"));
+        Directory.CreateDirectory(Path);
+    }
+
+    public string Path { get; }
+
+    public void Dispose()
+    {
+        if (Directory.Exists(Path))
+            Directory.Delete(Path, recursive: true);
+    }
 }
 
 sealed class TrackingDisposable : IDisposable
