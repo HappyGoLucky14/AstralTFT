@@ -49,7 +49,7 @@ internal sealed class Direct3D11CaptureDevice : IDisposable
                     result.CheckError();
 
                 result = D3D11.D3D11CreateDevice(
-                    adapter: nint.Zero,
+                    adapter: (IDXGIAdapter?)null,
                     DriverType.Warp,
                     DeviceCreationFlags.BgraSupport,
                     FeatureLevels,
@@ -130,7 +130,7 @@ internal static class Direct3DSurfaceInterop
     public static ID3D11Texture2D GetTexture2D(IDirect3DSurface surface)
     {
         ArgumentNullException.ThrowIfNull(surface);
-        var access = surface.As<IDirect3DDxgiInterfaceAccess>();
+        var access = WinRT.CastExtensions.As<IDirect3DDxgiInterfaceAccess>(surface);
         var pointer = access.GetInterface(ID3D11Texture2DGuid);
         if (pointer == 0)
             throw new InvalidOperationException("IDirect3DDxgiInterfaceAccess returned a null ID3D11Texture2D pointer.");
