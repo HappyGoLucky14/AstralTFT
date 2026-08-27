@@ -32,6 +32,8 @@ public partial class MainWindow : Window, INotifyPropertyChanged
     private readonly TftWindowLocator _locator = new();
     private readonly ShopSlotRecognizer _shopRecognizer = new();
     private readonly CancellationTokenSource _shutdown = new();
+    private int _shopHudConfirmationFrames;
+    private bool _shopHudConfirmed;
     private WindowsGraphicsCaptureFrameSource? _captureSource;
     private Task? _captureTask;
     private CancellationTokenSource? _captureSamplerCts;
@@ -231,20 +233,67 @@ public partial class MainWindow : Window, INotifyPropertyChanged
                     var elapsed = Stopwatch.GetElapsedTime(started);
                     benchmark.RecordRegionChange(change, elapsed);
 
-                    if (change.IsMeaningful &&
-                        frame.NativeFrameHandle is Bgra32FrameBuffer pixels)
+                    if (frame.NativeFrameHandle is Bgra32FrameBuffer pixels)
                     {
-                        var shop = _shopRecognizer.Recognize(pixels);
-                        var summary = string.Join(
-                            "  •  ",
-                            shop.Slots.Select(FormatShopSlot));
+                        ShopRecognitionResult? shop = null;
 
-                        await Dispatcher.InvokeAsync(() =>
+                        // Before the HUD is confirmed, probe each accepted ROI frame.
+                        // Three consecutive coherent five-card readings are required,
+                        // preventing loading/front-end imagery from becoming "ACTIVE".
+                        if (!_shopHudConfirmed)
                         {
-                            RecognitionState = "ACTIVE";
-                            RecognitionDetails = summary;
-                            FooterText = $"Structural recognition {shop.ProcessingTime.TotalMicroseconds:F1} µs • champion-name matching is the next gate.";
-                        });
+                            shop = _shopRecognizer.Recognize(pixels);
+
+                            if (shop.IsShopHudVisible)
+                            {
+                                _shopHudConfirmationFrames++;
+                                if (_shopHudConfirmationFrames >= 3)
+                                    _shopHudConfirmed = true;
+                            }
+                            else
+                            {
+                                _shopHudConfirmationFrames = 0;
+                            }
+                        }
+                        else if (change.IsMeaningful)
+                        {
+                            shop = _shopRecognizer.Recognize(pixels);
+
+                            // Leaving the shop/game should immediately stop surfacing the
+                            // previous structure instead of leaving stale or invented data.
+                            if (!shop.IsShopHudVisible)
+                            {
+                                _shopHudConfirmed = false;
+                                _shopHudConfirmationFrames = 0;
+                            }
+                        }
+
+                        if (shop is not null)
+                        {
+                            if (_shopHudConfirmed && shop.IsShopHudVisible)
+                            {
+                                var summary = string.Join(
+                                    "  •  ",
+                                    shop.Slots.Select(FormatShopSlot));
+
+                                await Dispatcher.InvokeAsync(() =>
+                                {
+                                    RecognitionState = "ACTIVE";
+                                    RecognitionDetails = summary;
+                                    FooterText = $"Shop HUD confirmed • structural recognition {shop.ProcessingTime.TotalMicroseconds:F1} µs • champion-name matching is the next gate.";
+                                });
+                            }
+                            else
+                            {
+                                var progress = Math.Clamp(_shopHudConfirmationFrames, 0, 3);
+                                await Dispatcher.InvokeAsync(() =>
+                                {
+                                    RecognitionState = "WAITING";
+                                    RecognitionDetails = $"Shop HUD not confirmed ({progress}/3). No slot guesses are shown.";
+                                    FooterText = "AstralTFT is waiting for the real in-match shop HUD before surfacing recognition.";
+                                });
+                            }
+                        }
                     }
                 }
             }

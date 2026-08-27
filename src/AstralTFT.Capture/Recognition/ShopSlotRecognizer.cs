@@ -19,6 +19,9 @@ public sealed record ShopSlotReading(
 
 public sealed record ShopRecognitionResult(
     IReadOnlyList<ShopSlotReading> Slots,
+    bool IsShopHudVisible,
+    int KnownSlotCount,
+    int UnitSlotCount,
     TimeSpan ProcessingTime);
 
 /// <summary>
@@ -83,9 +86,34 @@ public sealed class ShopSlotRecognizer
         for (var i = 0; i < regions.Count; i++)
             readings[i] = AnalyzeSlot(buffer, regions[i], i + 1);
 
+        var knownSlotCount = readings.Count(IsStructurallyKnown);
+        var unitSlotCount = readings.Count(x => x.Occupancy == ShopSlotOccupancy.Unit);
+
+        // Do not surface shop guesses merely because the TFT render window exists.
+        // A real shop row must resolve all five slots into a coherent card state,
+        // and at least one slot must contain a unit. Loading/front-end scenes often
+        // contain enough color/texture to fool individual slot heuristics, but they
+        // do not produce a complete five-card TFT shop structure.
+        var isShopHudVisible =
+            knownSlotCount == readings.Length &&
+            unitSlotCount >= 1;
+
         return new ShopRecognitionResult(
             readings,
-            System.Diagnostics.Stopwatch.GetElapsedTime(started));
+            IsShopHudVisible: isShopHudVisible,
+            KnownSlotCount: knownSlotCount,
+            UnitSlotCount: unitSlotCount,
+            ProcessingTime: System.Diagnostics.Stopwatch.GetElapsedTime(started));
+    }
+
+    private static bool IsStructurallyKnown(ShopSlotReading slot)
+    {
+        return slot.Occupancy switch
+        {
+            ShopSlotOccupancy.Empty => true,
+            ShopSlotOccupancy.Unit => slot.CostTier is >= 1 and <= 5,
+            _ => false
+        };
     }
 
     private static ShopSlotReading AnalyzeSlot(

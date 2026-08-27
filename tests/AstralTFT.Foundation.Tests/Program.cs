@@ -56,6 +56,7 @@ var tests = new (string Name, Action Run)[]
     ("Normalized WGC ROI projects deterministically", NormalizedWgcRoiProjectsDeterministically),
     ("Shop structure recognizer finds empty and cost tiers", ShopStructureRecognition),
     ("Shop cost bar median resists glyph noise", ShopCostBarMedianResistsGlyphNoise),
+    ("Shop HUD gate rejects incomplete false positives", ShopHudGateRejectsIncompleteFalsePositives),
 };
 
 var failures = new List<string>();
@@ -678,6 +679,8 @@ static void ShopStructureRecognition()
     var recognizer = new ShopSlotRecognizer();
     var result = recognizer.Recognize(new Bgra32FrameBuffer(width, height, stride, pixels));
 
+    True(result.IsShopHudVisible, "A complete five-slot shop should pass the HUD visibility gate.");
+    Equal(5, result.KnownSlotCount);
     Equal(ShopSlotOccupancy.Empty, result.Slots[0].Occupancy);
     Equal(0, result.Slots[0].CostTier);
 
@@ -803,6 +806,52 @@ static void PaintSparseNoise(
             SetBgra(pixels, stride, x, y, r, g, b);
         }
     }
+}
+
+
+static void ShopHudGateRejectsIncompleteFalsePositives()
+{
+    const int width = 1152;
+    const int height = 239;
+    const int stride = width * 4;
+    var pixels = new byte[stride * height];
+    FillBgra(pixels, stride, 0, 0, width, height, 14, 14, 10);
+
+    var slots = ShopSlotRecognizer.ProjectSlots(width, height);
+
+    // This mirrors the bad pre-game behavior we observed: several card-like regions
+    // happen to classify as tiers, but other slots are structurally unknown.
+    PaintSyntheticShopUnit(pixels, stride, slots[0], 18, 53, 44); // 2-cost
+    PaintSyntheticShopUnit(pixels, stride, slots[1], 96, 67, 24); // 5-cost
+    PaintSyntheticShopUnit(pixels, stride, slots[3], 18, 53, 44); // 2-cost
+
+    // Deliberately leave slots 3 and 5 as ambiguous non-empty texture.
+    FillBgra(
+        pixels,
+        stride,
+        slots[2].X,
+        slots[2].Y,
+        slots[2].Width,
+        slots[2].Height,
+        42,
+        42,
+        42);
+    FillBgra(
+        pixels,
+        stride,
+        slots[4].X,
+        slots[4].Y,
+        slots[4].Width,
+        slots[4].Height,
+        47,
+        47,
+        47);
+
+    var recognizer = new ShopSlotRecognizer();
+    var result = recognizer.Recognize(new Bgra32FrameBuffer(width, height, stride, pixels));
+
+    True(!result.IsShopHudVisible, "Incomplete/ambiguous slot structure must not activate the shop HUD.");
+    True(result.KnownSlotCount < 5, "False-positive frame should not resolve all five slots.");
 }
 
 static void NormalizedWgcRoiProjectsDeterministically()
