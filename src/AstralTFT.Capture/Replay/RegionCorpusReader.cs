@@ -1,4 +1,5 @@
 using System.Runtime.CompilerServices;
+using System.Text;
 using System.Text.Json;
 using System.Text.Json.Serialization;
 using AstralTFT.Capture.Recognition;
@@ -31,6 +32,8 @@ public sealed class RegionCorpusReader
         cancellationToken.ThrowIfCancellationRequested();
         IgnoredIncompleteTailCount = 0;
         ValidateHeader();
+        EnsureExistingDirectoryIsSafe(_rootDirectory, "corpus root");
+        RejectReparsePointIfPresent(_observationsPath, "corpus observation log");
         if (!File.Exists(_observationsPath))
             yield break;
 
@@ -53,7 +56,7 @@ public sealed class RegionCorpusReader
                 observation = JsonSerializer.Deserialize<RegionCorpusObservation>(current, JsonOptions)
                     ?? throw new InvalidDataException("Corpus observation is empty.");
             }
-            catch (JsonException) when (next is null)
+            catch (JsonException exception) when (next is null && IsIncompleteFinalJson(current, exception))
             {
                 IgnoredIncompleteTailCount++;
                 yield break;
@@ -63,12 +66,7 @@ public sealed class RegionCorpusReader
                 throw new InvalidDataException("Corpus observation is malformed.", exception);
             }
 
-            if (next is null && !IsValidObservation(observation, out var expectedLength))
-            {
-                IgnoredIncompleteTailCount++;
-                yield break;
-            }
-            if (!IsValidObservation(observation, out expectedLength))
+            if (!IsValidObservation(observation, out var expectedLength))
                 throw new InvalidDataException("Corpus observation is invalid.");
 
             var pixels = await ReadBlobAsync(observation.ContentHash, expectedLength, cancellationToken).ConfigureAwait(false);
@@ -94,7 +92,9 @@ public sealed class RegionCorpusReader
 
     private void ValidateHeader()
     {
+        EnsureExistingDirectoryIsSafe(_rootDirectory, "corpus root");
         var headerPath = Path.Combine(_rootDirectory, "corpus.json");
+        RejectReparsePointIfPresent(headerPath, "corpus header");
         if (!File.Exists(headerPath))
             throw new InvalidDataException("Corpus header does not exist.");
 
@@ -121,7 +121,10 @@ public sealed class RegionCorpusReader
         if (!IsValidContentHash(contentHash))
             throw new InvalidDataException("Corpus observation content hash is invalid.");
 
+        EnsureExistingDirectoryIsSafe(_rootDirectory, "corpus root");
+        EnsureExistingDirectoryIsSafe(_blobDirectory, "corpus blob directory");
         var blobPath = Path.Combine(_blobDirectory, contentHash + ".bgra");
+        RejectReparsePointIfPresent(blobPath, "corpus blob");
         try
         {
             await using var stream = new FileStream(
@@ -143,6 +146,10 @@ public sealed class RegionCorpusReader
         catch (FileNotFoundException exception)
         {
             throw new InvalidDataException("Corpus blob is missing.", exception);
+        }
+        catch (DirectoryNotFoundException exception)
+        {
+            throw new InvalidDataException("Corpus blob directory is missing.", exception);
         }
     }
 
@@ -176,6 +183,41 @@ public sealed class RegionCorpusReader
     private static bool IsValidContentHash(string? contentHash) =>
         contentHash is { Length: 64 } && contentHash.All(static character =>
             character is >= '0' and <= '9' or >= 'a' and <= 'f');
+
+    private static bool IsIncompleteFinalJson(string line, JsonException exception) =>
+        exception.LineNumber is 0 &&
+        exception.BytePositionInLine is long bytePosition &&
+        bytePosition >= Encoding.UTF8.GetByteCount(line);
+
+    private static void EnsureExistingDirectoryIsSafe(string path, string description)
+    {
+        RejectReparsePointIfPresent(path, description);
+        if (!Directory.Exists(path))
+            throw new InvalidDataException($"{description} does not exist.");
+    }
+
+    private static void RejectReparsePointIfPresent(string path, string description)
+    {
+        try
+        {
+            if ((File.GetAttributes(path) & FileAttributes.ReparsePoint) != 0)
+                throw new InvalidDataException($"{description} must not be a reparse point.");
+        }
+        catch (FileNotFoundException)
+        {
+        }
+        catch (DirectoryNotFoundException)
+        {
+        }
+        catch (UnauthorizedAccessException exception)
+        {
+            throw new InvalidDataException($"{description} cannot be inspected safely.", exception);
+        }
+        catch (IOException exception)
+        {
+            throw new InvalidDataException($"{description} cannot be inspected safely.", exception);
+        }
+    }
 
     private static JsonSerializerOptions CreateJsonOptions()
     {

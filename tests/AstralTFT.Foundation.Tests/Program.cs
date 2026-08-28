@@ -71,6 +71,9 @@ var tests = new (string Name, Action Run)[]
     ("Corpus store deduplicates blobs", CorpusStoreDeduplicatesBlobs),
     ("Corpus reader rejects hash mismatch", CorpusReaderRejectsHashMismatch),
     ("Corpus reader ignores only incomplete final line", CorpusReaderIgnoresIncompleteTail),
+    ("Corpus reader rejects complete final JSON corruption", CorpusReaderRejectsCompleteFinalJsonCorruption),
+    ("Corpus reader rejects invalid final metadata", CorpusReaderRejectsInvalidFinalMetadata),
+    ("Corpus reader normalizes a missing blob directory", CorpusReaderNormalizesMissingBlobDirectory),
 };
 
 var failures = new List<string>();
@@ -805,6 +808,47 @@ static void CorpusReaderIgnoresIncompleteTail()
         .AsTask().GetAwaiter().GetResult();
 
     Throws<InvalidDataException>(() => ReadCorpusAsync(new RegionCorpusReader(malformedTemporary.Path)).GetAwaiter().GetResult());
+}
+
+static void CorpusReaderRejectsCompleteFinalJsonCorruption()
+{
+    using var temporary = new TemporaryDirectory();
+    var store = new RegionCorpusStore(temporary.Path, "foundation-tests");
+    store.WriteAsync(new RegionCorpusWriteRequest(
+        "shop-slot-1", 101, new DateTimeOffset(2026, 8, 28, 12, 0, 0, TimeSpan.Zero),
+        2, 1, 8, [1, 2, 3, 255, 4, 5, 6, 255], RegionCorpusSourceKind.LiveCapture))
+        .AsTask().GetAwaiter().GetResult();
+    File.AppendAllText(Path.Combine(temporary.Path, "observations.jsonl"), "{not-json}" + Environment.NewLine);
+
+    Throws<InvalidDataException>(() => ReadCorpusAsync(new RegionCorpusReader(temporary.Path)).GetAwaiter().GetResult());
+}
+
+static void CorpusReaderRejectsInvalidFinalMetadata()
+{
+    using var temporary = new TemporaryDirectory();
+    var store = new RegionCorpusStore(temporary.Path, "foundation-tests");
+    store.WriteAsync(new RegionCorpusWriteRequest(
+        "shop-slot-1", 101, new DateTimeOffset(2026, 8, 28, 12, 0, 0, TimeSpan.Zero),
+        2, 1, 8, [1, 2, 3, 255, 4, 5, 6, 255], RegionCorpusSourceKind.LiveCapture))
+        .AsTask().GetAwaiter().GetResult();
+    File.AppendAllText(
+        Path.Combine(temporary.Path, "observations.jsonl"),
+        "{\"schemaVersion\":2,\"contentHash\":\"0000000000000000000000000000000000000000000000000000000000000000\",\"regionId\":\"shop-slot-2\",\"frameSequence\":102,\"capturedAtUtc\":\"2026-08-28T12:00:00+00:00\",\"width\":2,\"height\":1,\"stride\":8,\"sourceKind\":\"LiveCapture\"}" + Environment.NewLine);
+
+    Throws<InvalidDataException>(() => ReadCorpusAsync(new RegionCorpusReader(temporary.Path)).GetAwaiter().GetResult());
+}
+
+static void CorpusReaderNormalizesMissingBlobDirectory()
+{
+    using var temporary = new TemporaryDirectory();
+    var store = new RegionCorpusStore(temporary.Path, "foundation-tests");
+    store.WriteAsync(new RegionCorpusWriteRequest(
+        "shop-slot-1", 101, new DateTimeOffset(2026, 8, 28, 12, 0, 0, TimeSpan.Zero),
+        2, 1, 8, [1, 2, 3, 255, 4, 5, 6, 255], RegionCorpusSourceKind.LiveCapture))
+        .AsTask().GetAwaiter().GetResult();
+    Directory.Delete(Path.Combine(temporary.Path, "blobs"), recursive: true);
+
+    Throws<InvalidDataException>(() => ReadCorpusAsync(new RegionCorpusReader(temporary.Path)).GetAwaiter().GetResult());
 }
 
 static async Task<List<Bgra32RegionSnapshot>> ReadCorpusAsync(RegionCorpusReader reader)

@@ -23,8 +23,8 @@ public sealed class RegionCorpusStore : IRegionCorpusSink
         _rootDirectory = Path.GetFullPath(rootDirectory);
         _blobDirectory = Path.Combine(_rootDirectory, "blobs");
         _observationsPath = Path.Combine(_rootDirectory, "observations.jsonl");
-        Directory.CreateDirectory(_rootDirectory);
-        Directory.CreateDirectory(_blobDirectory);
+        EnsureDirectoryIsSafe(_rootDirectory, "corpus root");
+        EnsureDirectoryIsSafe(_blobDirectory, "corpus blob directory");
         EnsureHeader(createdByVersion);
     }
 
@@ -65,7 +65,9 @@ public sealed class RegionCorpusStore : IRegionCorpusSink
 
     private void EnsureHeader(string createdByVersion)
     {
+        EnsureDirectoryIsSafe(_rootDirectory, "corpus root");
         var headerPath = Path.Combine(_rootDirectory, "corpus.json");
+        RejectReparsePointIfPresent(headerPath, "corpus header");
         if (File.Exists(headerPath))
         {
             ValidateHeader(ReadHeader(headerPath));
@@ -79,6 +81,8 @@ public sealed class RegionCorpusStore : IRegionCorpusSink
                 new RegionCorpusHeader(SchemaVersion, PixelFormat, DateTimeOffset.UtcNow, createdByVersion), JsonOptions));
             try
             {
+                RejectReparsePointIfPresent(temporaryPath, "temporary corpus header");
+                RejectReparsePointIfPresent(headerPath, "corpus header");
                 File.Move(temporaryPath, headerPath, overwrite: false);
             }
             catch (IOException) when (File.Exists(headerPath))
@@ -95,7 +99,10 @@ public sealed class RegionCorpusStore : IRegionCorpusSink
 
     private bool WriteBlob(string contentHash, byte[] pixels)
     {
+        EnsureDirectoryIsSafe(_rootDirectory, "corpus root");
+        EnsureDirectoryIsSafe(_blobDirectory, "corpus blob directory");
         var blobPath = GetBlobPath(contentHash);
+        RejectReparsePointIfPresent(blobPath, "corpus blob");
         if (File.Exists(blobPath))
         {
             ValidateExistingBlob(blobPath, pixels);
@@ -108,6 +115,8 @@ public sealed class RegionCorpusStore : IRegionCorpusSink
             WriteFlushedFile(temporaryPath, pixels);
             try
             {
+                RejectReparsePointIfPresent(temporaryPath, "temporary corpus blob");
+                RejectReparsePointIfPresent(blobPath, "corpus blob");
                 File.Move(temporaryPath, blobPath, overwrite: false);
                 return true;
             }
@@ -126,6 +135,8 @@ public sealed class RegionCorpusStore : IRegionCorpusSink
 
     private void AppendObservation(RegionCorpusObservation observation)
     {
+        EnsureDirectoryIsSafe(_rootDirectory, "corpus root");
+        RejectReparsePointIfPresent(_observationsPath, "corpus observation log");
         var payload = JsonSerializer.SerializeToUtf8Bytes(observation, JsonOptions);
         using var stream = new FileStream(
             _observationsPath,
@@ -154,6 +165,7 @@ public sealed class RegionCorpusStore : IRegionCorpusSink
 
     private static void ValidateExistingBlob(string blobPath, byte[] expectedPixels)
     {
+        RejectReparsePointIfPresent(blobPath, "corpus blob");
         using var stream = new FileStream(blobPath, FileMode.Open, FileAccess.Read, FileShare.Read);
         if (stream.Length != expectedPixels.Length)
             throw new InvalidDataException("Existing corpus blob has an unexpected length.");
@@ -166,6 +178,7 @@ public sealed class RegionCorpusStore : IRegionCorpusSink
 
     private static RegionCorpusHeader ReadHeader(string headerPath)
     {
+        RejectReparsePointIfPresent(headerPath, "corpus header");
         try
         {
             return JsonSerializer.Deserialize<RegionCorpusHeader>(File.ReadAllText(headerPath), JsonOptions)
@@ -208,6 +221,36 @@ public sealed class RegionCorpusStore : IRegionCorpusSink
     private static bool IsValidContentHash(string? contentHash) =>
         contentHash is { Length: 64 } && contentHash.All(static character =>
             character is >= '0' and <= '9' or >= 'a' and <= 'f');
+
+    private static void EnsureDirectoryIsSafe(string path, string description)
+    {
+        RejectReparsePointIfPresent(path, description);
+        Directory.CreateDirectory(path);
+        RejectReparsePointIfPresent(path, description);
+    }
+
+    private static void RejectReparsePointIfPresent(string path, string description)
+    {
+        try
+        {
+            if ((File.GetAttributes(path) & FileAttributes.ReparsePoint) != 0)
+                throw new InvalidDataException($"{description} must not be a reparse point.");
+        }
+        catch (FileNotFoundException)
+        {
+        }
+        catch (DirectoryNotFoundException)
+        {
+        }
+        catch (UnauthorizedAccessException exception)
+        {
+            throw new InvalidDataException($"{description} cannot be inspected safely.", exception);
+        }
+        catch (IOException exception)
+        {
+            throw new InvalidDataException($"{description} cannot be inspected safely.", exception);
+        }
+    }
 
     private static JsonSerializerOptions CreateJsonOptions()
     {
