@@ -18,17 +18,14 @@ public sealed record RegionCorpusConfiguration(
 
         try
         {
-            // Reject before Path.GetFullPath so device-UNC paths receive the same
-            // fixed footer-safe diagnostic even if the runtime refuses to normalize
-            // one of their alternate separator forms.
-            if (IsNetworkPath(directory))
+            // The opt-in corpus supports only direct drive-rooted paths. Reject all
+            // native/device namespaces lexically before normalization so no UNC,
+            // MUP, GLOBALROOT, or root-relative spelling can reach storage setup.
+            if (!IsDirectDriveRootedPath(directory))
                 return Disabled(DirectLocalPathDiagnostic);
 
-            if (!Path.IsPathFullyQualified(directory))
-                return Disabled("Corpus directory must be an absolute path.");
-
             var normalizedDirectory = Path.GetFullPath(directory);
-            if (IsNetworkPath(normalizedDirectory))
+            if (!IsDirectDriveRootedPath(normalizedDirectory))
                 return Disabled(DirectLocalPathDiagnostic);
 
             return new RegionCorpusConfiguration(
@@ -41,7 +38,7 @@ public sealed record RegionCorpusConfiguration(
             NotSupportedException or
             IOException)
         {
-            return Disabled("Corpus directory must be a valid absolute path.");
+            return Disabled("Corpus directory must be a valid direct local path.");
         }
     }
 
@@ -50,19 +47,12 @@ public sealed record RegionCorpusConfiguration(
         DirectoryPath: null,
         Diagnostic: diagnostic);
 
-    private static bool IsNetworkPath(string path)
+    private static bool IsDirectDriveRootedPath(string path)
     {
-        var normalizedSeparators = path.Replace('/', '\\');
-        if (normalizedSeparators.StartsWith(@"\\?\UNC\", StringComparison.OrdinalIgnoreCase) ||
-            normalizedSeparators.StartsWith(@"\\.\UNC\", StringComparison.OrdinalIgnoreCase))
-        {
-            return true;
-        }
+        if (path.Length < 3 || path[1] != ':' || (path[2] is not ('\\' or '/')))
+            return false;
 
-        // Conventional UNC paths begin with two separators. Local device paths
-        // such as \\?\C:\corpus remain direct local paths and are not rejected.
-        return normalizedSeparators.StartsWith(@"\\", StringComparison.Ordinal) &&
-               !normalizedSeparators.StartsWith(@"\\?\", StringComparison.Ordinal) &&
-               !normalizedSeparators.StartsWith(@"\\.\", StringComparison.Ordinal);
+        var drive = path[0];
+        return (drive is >= 'A' and <= 'Z') || (drive is >= 'a' and <= 'z');
     }
 }

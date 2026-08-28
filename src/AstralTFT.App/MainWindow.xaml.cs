@@ -34,6 +34,7 @@ public partial class MainWindow : Window, INotifyPropertyChanged
     private readonly ShopSlotRecognizer _shopRecognizer = new();
     private readonly CancellationTokenSource _shutdown = new();
     private readonly object _corpusRecorderGate = new();
+    private readonly ReplayCorpusStopGate _stopCaptureGate = new();
     private const int ShopHudConfirmFrames = 3;
     private const int ShopHudDropFrames = 20;
 
@@ -559,7 +560,10 @@ public partial class MainWindow : Window, INotifyPropertyChanged
         await StopCaptureAsync(args.Reason, args.Error);
     }
 
-    private async Task StopCaptureAsync(WgcCaptureEndReason reason, Exception? error)
+    private Task StopCaptureAsync(WgcCaptureEndReason reason, Exception? error) =>
+        _stopCaptureGate.RunAsync(() => StopCaptureCoreAsync(reason, error));
+
+    private async Task StopCaptureCoreAsync(WgcCaptureEndReason reason, Exception? error)
     {
         var source = _captureSource;
         var benchmark = _benchmark;

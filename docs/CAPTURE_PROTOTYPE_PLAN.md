@@ -68,7 +68,7 @@ Recognition backlog is bounded in two places:
 
 ## Developer replay corpus
 
-The replay corpus is an opt-in local developer switch. Configure it with a direct, fully-qualified local path; UNC and device-UNC paths are rejected. Mapped-drive targets are not classified, so choose a known local volume. It records only the five projected shop slots after a confirmed, meaningful shop change; it does not capture the desktop, game memory, input, or opponent data. Developer-mode pixel copies and corpus I/O may add overhead.
+The replay corpus is an opt-in local developer switch. Its supported grammar is a direct drive-rooted path only: `X:\...` or `X:/...`, normalized locally with `Path.GetFullPath`. UNC, device, native, root-relative, and other namespace paths are rejected. Mapped drive letters are not classified, so users must select a local disk. It records only the five projected shop slots after a confirmed, meaningful shop change; it does not capture the desktop, game memory, input, or opponent data. Developer-mode pixel copies and corpus I/O may add overhead.
 
 ```powershell
 $env:ASTRALTFT_CORPUS_DIRECTORY = 'D:\AstralTFT-Corpus\set18-shop'

@@ -81,8 +81,9 @@ var tests = new (string Name, Action Run)[]
     ("Corpus recorder isolates sink failures", CorpusRecorderIsolatesSinkFailures),
     ("Corpus recorder stops acceptance while draining", CorpusRecorderStopsAcceptanceWhileDraining),
     ("Corpus recorder drains while capture stop is deferred", CorpusRecorderDrainsWhileCaptureStopIsDeferred),
+    ("Corpus stop gate shares an overlapping drain", CorpusStopGateSharesOverlappingDrain),
     ("Corpus configuration requires an absolute directory", CorpusConfigurationRequiresAbsolutePath),
-    ("Corpus configuration rejects network directories", CorpusConfigurationRejectsNetworkDirectories),
+    ("Corpus configuration rejects non-local directories", CorpusConfigurationRejectsNonLocalDirectories),
     ("Shop HUD confirmation is scoped to one capture session", ShopHudSessionDoesNotReuseConfirmation),
     ("Shop corpus capture submits packed slot snapshots", ShopCorpusCaptureSubmitsPackedSlots),
     ("Shop corpus capture isolates one slot failure", ShopCorpusCaptureIsolatesOneSlotFailure),
@@ -741,25 +742,38 @@ static void CorpusConfigurationRequiresAbsolutePath()
     Equal(Path.GetFullPath(absolutePath), enabled.DirectoryPath);
     True(enabled.Diagnostic is null, "Valid corpus configuration must not report an error.");
     True(!Directory.Exists(absolutePath), "Parsing corpus configuration must not create a directory.");
+
+    var forwardSlashPath = absolutePath.Replace('\\', '/');
+    var forwardSlash = RegionCorpusConfiguration.FromEnvironmentValue(forwardSlashPath);
+    True(forwardSlash.Enabled, "A drive-rooted path using forward separators must enable recording.");
+    Equal(Path.GetFullPath(absolutePath), forwardSlash.DirectoryPath);
 }
 
-static void CorpusConfigurationRejectsNetworkDirectories()
+static void CorpusConfigurationRejectsNonLocalDirectories()
 {
-    string[] networkDirectories =
+    string[] unsupportedDirectories =
     [
         @"\\server\share\astraltft-corpus",
         "//server/share/astraltft-corpus",
         @"\\?\UNC\server\share\astraltft-corpus",
         "//?/UNC/server/share/astraltft-corpus",
+        @"\\?\GLOBALROOT\Device\Mup\server\share\astraltft-corpus",
+        @"\??\UNC\server\share\astraltft-corpus",
+        @"\\?\C:\astraltft-corpus",
+        @"\\.\C:\astraltft-corpus",
+        @"\??\C:\astraltft-corpus",
+        @"C:astraltft-drive-relative-corpus",
+        @"\astraltft-root-relative-corpus",
+        "/astraltft-root-relative-corpus",
     ];
 
-    foreach (var directory in networkDirectories)
+    foreach (var directory in unsupportedDirectories)
     {
         var configuration = RegionCorpusConfiguration.FromEnvironmentValue(directory);
-        True(!configuration.Enabled, "Network corpus directories must be rejected.");
-        True(configuration.DirectoryPath is null, "Rejected network directories must not select a corpus directory.");
+        True(!configuration.Enabled, "Unsupported corpus directories must be rejected.");
+        True(configuration.DirectoryPath is null, "Rejected directories must not select a corpus directory.");
         Equal("Corpus directory must be a direct local path.", configuration.Diagnostic);
-        True(!configuration.Diagnostic!.Any(char.IsControl), "Network path diagnostics must be safe for a one-line footer.");
+        True(!configuration.Diagnostic!.Any(char.IsControl), "Rejected-path diagnostics must be safe for a one-line footer.");
     }
 }
 
@@ -1120,6 +1134,67 @@ static void CorpusRecorderDrainsWhileCaptureStopIsDeferred()
         True(!result.CaptureConsumerStopped, "A timed-out source stop must not be reported as a stopped consumer.");
         True(!deferredCaptureConsumer.Task.IsCompleted, "A timed-out source stop must not make recorder draining wait for an unresolved consumer.");
         Equal(1L, recorder.Metrics.Written);
+    }
+    finally
+    {
+        sink.ReleaseFirstWrite();
+        recorder.DisposeAsync().AsTask().GetAwaiter().GetResult();
+        snapshot.Dispose();
+    }
+}
+
+static void CorpusStopGateSharesOverlappingDrain()
+{
+    var sink = new BlockingCorpusSink();
+    var recorder = new BoundedRegionCorpusRecorder(sink, capacity: 1);
+    var snapshot = CorpusSnapshot("shop-slot-1", 101, new byte[] { 1, 2, 3, 255, 4, 5, 6, 255 });
+    var gate = new ReplayCorpusStopGate();
+    var firstCoreEntered = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+    var firstCoreStarts = 0;
+    var secondCoreStarts = 0;
+
+    try
+    {
+        True(recorder.TryRecord(snapshot, RegionCorpusSourceKind.LiveCapture), "The first stop must have accepted corpus work to drain.");
+        sink.WaitForFirstWrite();
+
+        Task FirstStopCoreAsync()
+        {
+            Interlocked.Increment(ref firstCoreStarts);
+            firstCoreEntered.TrySetResult();
+            return ReplayCorpusStopCoordinator.StopAndDrainAsync(
+                recorder,
+                captureConsumerTask: null,
+                stopSourceAsync: null,
+                sourceStopTimeout: TimeSpan.FromMilliseconds(50));
+        }
+
+        var firstStop = gate.RunAsync(FirstStopCoreAsync);
+        firstCoreEntered.Task.GetAwaiter().GetResult();
+        var secondStop = gate.RunAsync(() =>
+        {
+            Interlocked.Increment(ref secondCoreStarts);
+            return Task.CompletedTask;
+        });
+
+        True(ReferenceEquals(firstStop, secondStop), "Overlapping stop callers must receive the same in-flight task.");
+        True(!firstStop.IsCompleted && !secondStop.IsCompleted, "Neither stop caller may complete before the accepted corpus write drains.");
+        Equal(1, firstCoreStarts);
+        Equal(0, secondCoreStarts);
+
+        sink.ReleaseFirstWrite();
+        Task.WhenAll(firstStop, secondStop).WaitAsync(TimeSpan.FromSeconds(2)).GetAwaiter().GetResult();
+        Equal(1L, recorder.Metrics.Written);
+
+        var nextStop = gate.RunAsync(() =>
+        {
+            Interlocked.Increment(ref secondCoreStarts);
+            return Task.CompletedTask;
+        });
+        nextStop.WaitAsync(TimeSpan.FromSeconds(2)).GetAwaiter().GetResult();
+
+        True(!ReferenceEquals(firstStop, nextStop), "A completed stop operation must clear the gate for the next lifecycle stop.");
+        Equal(1, secondCoreStarts);
     }
     finally
     {

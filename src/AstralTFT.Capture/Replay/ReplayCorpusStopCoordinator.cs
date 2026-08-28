@@ -9,6 +9,67 @@ public sealed record ReplayCorpusStopResult(
     bool SourceStopTimedOut);
 
 /// <summary>
+/// Publishes one stop operation at a time. All overlapping callers receive the
+/// same task, and a later stop can start only after the published operation has
+/// completed its full caller-supplied cleanup body.
+/// </summary>
+public sealed class ReplayCorpusStopGate
+{
+    private readonly object _gate = new();
+    private Task? _inFlight;
+
+    /// <summary>
+    /// Starts <paramref name="stopAsync"/> only when no stop is in flight.
+    /// </summary>
+    public Task RunAsync(Func<Task> stopAsync)
+    {
+        ArgumentNullException.ThrowIfNull(stopAsync);
+
+        TaskCompletionSource completion;
+        lock (_gate)
+        {
+            if (_inFlight is not null)
+                return _inFlight;
+
+            // Publish before invoking the core so a synchronously completed core
+            // cannot leave a second caller observing an empty gate mid-start.
+            completion = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+            _inFlight = completion.Task;
+        }
+
+        _ = RunAndClearAsync(stopAsync, completion);
+        return completion.Task;
+    }
+
+    private async Task RunAndClearAsync(Func<Task> stopAsync, TaskCompletionSource completion)
+    {
+        Exception? failure = null;
+        try
+        {
+            await stopAsync().ConfigureAwait(false);
+        }
+        catch (Exception exception)
+        {
+            failure = exception;
+        }
+
+        // Clear after the complete core body has finished, but before publishing
+        // completion, so a caller that observes a completed task can begin a new
+        // lifecycle operation without receiving a stale completed task.
+        lock (_gate)
+        {
+            if (ReferenceEquals(_inFlight, completion.Task))
+                _inFlight = null;
+        }
+
+        if (failure is null)
+            completion.TrySetResult();
+        else
+            completion.TrySetException(failure);
+    }
+}
+
+/// <summary>
 /// Coordinates source shutdown with the independent, detached corpus writer.
 /// </summary>
 public static class ReplayCorpusStopCoordinator
