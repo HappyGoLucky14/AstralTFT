@@ -82,8 +82,13 @@ var tests = new (string Name, Action Run)[]
     ("Corpus recorder stops acceptance while draining", CorpusRecorderStopsAcceptanceWhileDraining),
     ("Corpus recorder drains while capture stop is deferred", CorpusRecorderDrainsWhileCaptureStopIsDeferred),
     ("Corpus stop gate shares an overlapping drain", CorpusStopGateSharesOverlappingDrain),
+    ("Corpus shutdown gate retains an overlapping drain", CorpusShutdownGateRetainsOverlappingDrain),
+    ("Corpus shutdown gate retains a fault", CorpusShutdownGateRetainsFault),
     ("Corpus configuration requires an absolute directory", CorpusConfigurationRequiresAbsolutePath),
     ("Corpus configuration rejects non-local directories", CorpusConfigurationRejectsNonLocalDirectories),
+    ("Corpus configuration rejects a classified network drive", CorpusConfigurationRejectsClassifiedNetworkDrive),
+    ("Corpus configuration rejects an existing reparse component", CorpusConfigurationRejectsExistingReparseComponent),
+    ("Corpus configuration fails closed for unusable drives", CorpusConfigurationFailsClosedForUnusableDrives),
     ("Shop HUD confirmation is scoped to one capture session", ShopHudSessionDoesNotReuseConfirmation),
     ("Shop corpus capture submits packed slot snapshots", ShopCorpusCaptureSubmitsPackedSlots),
     ("Shop corpus capture isolates one slot failure", ShopCorpusCaptureIsolatesOneSlotFailure),
@@ -777,6 +782,76 @@ static void CorpusConfigurationRejectsNonLocalDirectories()
     }
 }
 
+static void CorpusConfigurationRejectsClassifiedNetworkDrive()
+{
+    var classifier = new FixedCorpusDriveClassifier(DriveType.Network, isReady: true);
+
+    var configuration = RegionCorpusConfiguration.FromEnvironmentValue(
+        @"Z:\corpus",
+        classifier);
+
+    True(!configuration.Enabled, "A drive classified as Network must disable corpus recording.");
+    True(configuration.DirectoryPath is null, "A network drive must not select a corpus directory.");
+    Equal("Corpus directory must be a direct local path.", configuration.Diagnostic);
+    Equal(@"Z:\", classifier.LastRootDirectory);
+}
+
+static void CorpusConfigurationRejectsExistingReparseComponent()
+{
+    var directory = Path.Combine(Path.GetTempPath(), "astraltft-foundation-reparse-" + Guid.NewGuid().ToString("N"));
+    var classifier = new FixedCorpusDriveClassifier(DriveType.Fixed, isReady: true);
+    var reparseInspector = new FixedCorpusReparsePointInspector(hasExistingReparsePoint: true);
+
+    var configuration = RegionCorpusConfiguration.FromEnvironmentValue(
+        directory,
+        classifier,
+        reparseInspector);
+
+    True(!configuration.Enabled, "A path with an existing reparse-point component must disable corpus recording.");
+    True(configuration.DirectoryPath is null, "A reparse-point path must not select a corpus directory.");
+    Equal("Corpus directory must be a direct local path.", configuration.Diagnostic);
+    Equal(Path.GetFullPath(directory), reparseInspector.LastDirectory);
+    True(!Directory.Exists(directory), "Configuration inspection must not create a reparse-point corpus directory.");
+}
+
+static void CorpusConfigurationFailsClosedForUnusableDrives()
+{
+    var directory = Path.Combine(Path.GetTempPath(), "astraltft-foundation-unusable-" + Guid.NewGuid().ToString("N"));
+    RegionCorpusDriveInfo[] unusableDrives =
+    [
+        new RegionCorpusDriveInfo(DriveType.Unknown, IsReady: true),
+        new RegionCorpusDriveInfo(DriveType.NoRootDirectory, IsReady: true),
+        new RegionCorpusDriveInfo(DriveType.Fixed, IsReady: false),
+    ];
+
+    foreach (var drive in unusableDrives)
+    {
+        var configuration = RegionCorpusConfiguration.FromEnvironmentValue(
+            directory,
+            new FixedCorpusDriveClassifier(drive.DriveType, drive.IsReady));
+
+        True(!configuration.Enabled, "An unready or uninspectable drive classification must disable corpus recording.");
+        True(configuration.DirectoryPath is null, "An unusable drive must not select a corpus directory.");
+        Equal("Corpus directory must be a direct local path.", configuration.Diagnostic);
+    }
+
+    var inspectionFailure = RegionCorpusConfiguration.FromEnvironmentValue(
+        directory,
+        new ThrowingCorpusDriveClassifier());
+    True(!inspectionFailure.Enabled, "A drive inspection failure must disable corpus recording.");
+    True(inspectionFailure.DirectoryPath is null, "An inspection failure must not select a corpus directory.");
+    Equal("Corpus directory must be a direct local path.", inspectionFailure.Diagnostic);
+
+    var reparseInspectionFailure = RegionCorpusConfiguration.FromEnvironmentValue(
+        directory,
+        new FixedCorpusDriveClassifier(DriveType.Fixed, isReady: true),
+        new ThrowingCorpusReparsePointInspector());
+    True(!reparseInspectionFailure.Enabled, "A reparse-point inspection failure must disable corpus recording.");
+    True(reparseInspectionFailure.DirectoryPath is null, "A reparse inspection failure must not select a corpus directory.");
+    Equal("Corpus directory must be a direct local path.", reparseInspectionFailure.Diagnostic);
+    True(!Directory.Exists(directory), "Failed drive inspection must not create a corpus directory.");
+}
+
 static void ShopHudSessionDoesNotReuseConfirmation()
 {
     var visibleMeaningfulHud = new ShopHudObservation(
@@ -1202,6 +1277,100 @@ static void CorpusStopGateSharesOverlappingDrain()
         recorder.DisposeAsync().AsTask().GetAwaiter().GetResult();
         snapshot.Dispose();
     }
+}
+
+static void CorpusShutdownGateRetainsOverlappingDrain()
+{
+    var sink = new BlockingCorpusSink();
+    var recorder = new BoundedRegionCorpusRecorder(sink, capacity: 1);
+    var snapshot = CorpusSnapshot("shop-slot-1", 102, new byte[] { 1, 2, 3, 255, 4, 5, 6, 255 });
+    var gate = new ReplayCorpusShutdownGate();
+    var firstCoreEntered = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+    var firstCoreStarts = 0;
+    var laterCoreStarts = 0;
+
+    try
+    {
+        True(recorder.TryRecord(snapshot, RegionCorpusSourceKind.LiveCapture), "The shutdown must have accepted corpus work to drain.");
+        sink.WaitForFirstWrite();
+
+        Task FirstShutdownCoreAsync()
+        {
+            Interlocked.Increment(ref firstCoreStarts);
+            firstCoreEntered.TrySetResult();
+            return ReplayCorpusStopCoordinator.StopAndDrainAsync(
+                recorder,
+                captureConsumerTask: null,
+                stopSourceAsync: null,
+                sourceStopTimeout: TimeSpan.FromMilliseconds(50));
+        }
+
+        var firstShutdown = gate.RunAsync(FirstShutdownCoreAsync);
+        firstCoreEntered.Task.GetAwaiter().GetResult();
+        var secondShutdown = gate.RunAsync(() =>
+        {
+            Interlocked.Increment(ref laterCoreStarts);
+            return Task.CompletedTask;
+        });
+
+        True(ReferenceEquals(firstShutdown, secondShutdown), "Re-entrant shutdown callers must receive the same incomplete task.");
+        True(!firstShutdown.IsCompleted && !secondShutdown.IsCompleted, "Neither shutdown caller may finish before accepted corpus work drains.");
+        Equal(1, firstCoreStarts);
+        Equal(0, laterCoreStarts);
+
+        sink.ReleaseFirstWrite();
+        Task.WhenAll(firstShutdown, secondShutdown).WaitAsync(TimeSpan.FromSeconds(2)).GetAwaiter().GetResult();
+        Equal(1L, recorder.Metrics.Written);
+
+        var laterShutdown = gate.RunAsync(() =>
+        {
+            Interlocked.Increment(ref laterCoreStarts);
+            return Task.CompletedTask;
+        });
+
+        True(ReferenceEquals(firstShutdown, laterShutdown), "Completed shutdown must remain the retained shutdown task.");
+        True(laterShutdown.IsCompletedSuccessfully, "Later shutdown callers must observe the completed shared task.");
+        Equal(1, firstCoreStarts);
+        Equal(0, laterCoreStarts);
+    }
+    finally
+    {
+        sink.ReleaseFirstWrite();
+        recorder.DisposeAsync().AsTask().GetAwaiter().GetResult();
+        snapshot.Dispose();
+    }
+}
+
+static void CorpusShutdownGateRetainsFault()
+{
+    var gate = new ReplayCorpusShutdownGate();
+    var coreStarts = 0;
+
+    Task FailingShutdownCoreAsync()
+    {
+        Interlocked.Increment(ref coreStarts);
+        return Task.FromException(new InvalidOperationException("shutdown gate test fault"));
+    }
+
+    var firstShutdown = gate.RunAsync(FailingShutdownCoreAsync);
+    var secondShutdown = gate.RunAsync(() =>
+    {
+        Interlocked.Increment(ref coreStarts);
+        return Task.CompletedTask;
+    });
+
+    True(ReferenceEquals(firstShutdown, secondShutdown), "Faulting shutdown callers must still share one task.");
+    Throws<InvalidOperationException>(() => firstShutdown.GetAwaiter().GetResult());
+
+    var laterShutdown = gate.RunAsync(() =>
+    {
+        Interlocked.Increment(ref coreStarts);
+        return Task.CompletedTask;
+    });
+
+    True(ReferenceEquals(firstShutdown, laterShutdown), "A faulted shutdown task must stay retained for later callers.");
+    Throws<InvalidOperationException>(() => laterShutdown.GetAwaiter().GetResult());
+    Equal(1, coreStarts);
 }
 
 static Bgra32RegionSnapshot CorpusSnapshot(string regionId, long sequence, byte[] pixels) => new(
@@ -1949,6 +2118,40 @@ sealed class BlockingCorpusSink : IRegionCorpusSink
         await _releaseFirstWrite.Task.ConfigureAwait(false);
         return new RegionCorpusWriteResult("first", BlobCreated: true);
     }
+}
+
+sealed class FixedCorpusDriveClassifier(DriveType driveType, bool isReady) : IRegionCorpusDriveClassifier
+{
+    public string? LastRootDirectory { get; private set; }
+
+    public RegionCorpusDriveInfo Classify(string rootDirectory)
+    {
+        LastRootDirectory = rootDirectory;
+        return new RegionCorpusDriveInfo(driveType, isReady);
+    }
+}
+
+sealed class ThrowingCorpusDriveClassifier : IRegionCorpusDriveClassifier
+{
+    public RegionCorpusDriveInfo Classify(string rootDirectory) =>
+        throw new IOException("injected drive inspection failure");
+}
+
+sealed class FixedCorpusReparsePointInspector(bool hasExistingReparsePoint) : IRegionCorpusReparsePointInspector
+{
+    public string? LastDirectory { get; private set; }
+
+    public bool HasExistingReparsePointComponent(string normalizedDirectory)
+    {
+        LastDirectory = normalizedDirectory;
+        return hasExistingReparsePoint;
+    }
+}
+
+sealed class ThrowingCorpusReparsePointInspector : IRegionCorpusReparsePointInspector
+{
+    public bool HasExistingReparsePointComponent(string normalizedDirectory) =>
+        throw new IOException("injected reparse inspection failure");
 }
 
 sealed class SequencedCorpusSink(params RegionCorpusWriteResult[] results) : IRegionCorpusSink

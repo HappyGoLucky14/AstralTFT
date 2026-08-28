@@ -35,6 +35,7 @@ public partial class MainWindow : Window, INotifyPropertyChanged
     private readonly CancellationTokenSource _shutdown = new();
     private readonly object _corpusRecorderGate = new();
     private readonly ReplayCorpusStopGate _stopCaptureGate = new();
+    private readonly ReplayCorpusShutdownGate _shutdownGate = new();
     private const int ShopHudConfirmFrames = 3;
     private const int ShopHudDropFrames = 20;
 
@@ -48,8 +49,8 @@ public partial class MainWindow : Window, INotifyPropertyChanged
     private nint _capturedHwnd;
     private bool _everAttached;
     private int _missingAfterAttachCount;
-    private int _shutdownStarted;
-    private bool _allowClose;
+    private int _finalCloseRequested;
+    private int _allowClose;
     private DateTimeOffset _captureStartedAt;
 
     private string _statusText = "WAITING";
@@ -629,7 +630,7 @@ public partial class MainWindow : Window, INotifyPropertyChanged
 
     private async void OnClosing(object? sender, CancelEventArgs e)
     {
-        if (_allowClose)
+        if (Volatile.Read(ref _allowClose) != 0)
             return;
 
         // WPF normally tears the process down as soon as the last window closes.
@@ -643,17 +644,28 @@ public partial class MainWindow : Window, INotifyPropertyChanged
         }
         finally
         {
-            _allowClose = true;
-            Close();
+            if (Interlocked.Exchange(ref _finalCloseRequested, 1) == 0)
+            {
+                Volatile.Write(ref _allowClose, 1);
+                Close();
+            }
         }
     }
 
-    private async Task ShutdownAsync()
+    private Task ShutdownAsync() =>
+        _shutdownGate.RunAsync(ShutdownCoreAsync);
+
+    private async Task ShutdownCoreAsync()
     {
-        if (Interlocked.Exchange(ref _shutdownStarted, 1) != 0) return;
-        _shutdown.Cancel();
-        await StopCaptureAsync(WgcCaptureEndReason.Requested, null);
-        _shutdown.Dispose();
+        try
+        {
+            _shutdown.Cancel();
+            await StopCaptureAsync(WgcCaptureEndReason.Requested, null);
+        }
+        finally
+        {
+            _shutdown.Dispose();
+        }
     }
 
     public event PropertyChangedEventHandler? PropertyChanged;

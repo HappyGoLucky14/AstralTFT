@@ -70,6 +70,54 @@ public sealed class ReplayCorpusStopGate
 }
 
 /// <summary>
+/// Publishes one application-shutdown operation for the lifetime of its owner.
+/// Every caller receives the same task, including callers that arrive after the
+/// shutdown has completed or faulted.
+/// </summary>
+public sealed class ReplayCorpusShutdownGate
+{
+    private readonly object _gate = new();
+    private Task? _shutdownTask;
+
+    /// <summary>
+    /// Starts <paramref name="shutdownAsync"/> once and retains its completion
+    /// or fault for every later caller.
+    /// </summary>
+    public Task RunAsync(Func<Task> shutdownAsync)
+    {
+        ArgumentNullException.ThrowIfNull(shutdownAsync);
+
+        TaskCompletionSource completion;
+        lock (_gate)
+        {
+            if (_shutdownTask is not null)
+                return _shutdownTask;
+
+            // Publish before invoking the core so synchronous completion or a
+            // re-entrant close cannot observe an empty shutdown gate.
+            completion = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+            _shutdownTask = completion.Task;
+        }
+
+        _ = RunAndCompleteAsync(shutdownAsync, completion);
+        return completion.Task;
+    }
+
+    private static async Task RunAndCompleteAsync(Func<Task> shutdownAsync, TaskCompletionSource completion)
+    {
+        try
+        {
+            await shutdownAsync().ConfigureAwait(false);
+            completion.TrySetResult();
+        }
+        catch (Exception exception)
+        {
+            completion.TrySetException(exception);
+        }
+    }
+}
+
+/// <summary>
 /// Coordinates source shutdown with the independent, detached corpus writer.
 /// </summary>
 public static class ReplayCorpusStopCoordinator
