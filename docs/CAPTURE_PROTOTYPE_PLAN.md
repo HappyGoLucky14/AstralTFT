@@ -68,7 +68,7 @@ Recognition backlog is bounded in two places:
 
 ## Developer replay corpus
 
-The replay corpus is an opt-in local developer switch. It records only the five projected shop slots after a confirmed, meaningful shop change; it does not capture the desktop, game memory, input, opponent data, or network traffic. Developer-mode pixel copies and local I/O may add overhead.
+The replay corpus is an opt-in local developer switch. Configure it with a direct, fully-qualified local path; UNC and device-UNC paths are rejected. Mapped-drive targets are not classified, so choose a known local volume. It records only the five projected shop slots after a confirmed, meaningful shop change; it does not capture the desktop, game memory, input, or opponent data. Developer-mode pixel copies and corpus I/O may add overhead.
 
 ```powershell
 $env:ASTRALTFT_CORPUS_DIRECTORY = 'D:\AstralTFT-Corpus\set18-shop'

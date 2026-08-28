@@ -8,6 +8,8 @@ public sealed record RegionCorpusConfiguration(
     string? DirectoryPath,
     string? Diagnostic)
 {
+    private const string DirectLocalPathDiagnostic = "Corpus directory must be a direct local path.";
+
     public static RegionCorpusConfiguration FromEnvironmentValue(string? value)
     {
         var directory = value?.Trim();
@@ -16,12 +18,22 @@ public sealed record RegionCorpusConfiguration(
 
         try
         {
+            // Reject before Path.GetFullPath so device-UNC paths receive the same
+            // fixed footer-safe diagnostic even if the runtime refuses to normalize
+            // one of their alternate separator forms.
+            if (IsNetworkPath(directory))
+                return Disabled(DirectLocalPathDiagnostic);
+
             if (!Path.IsPathFullyQualified(directory))
                 return Disabled("Corpus directory must be an absolute path.");
 
+            var normalizedDirectory = Path.GetFullPath(directory);
+            if (IsNetworkPath(normalizedDirectory))
+                return Disabled(DirectLocalPathDiagnostic);
+
             return new RegionCorpusConfiguration(
                 Enabled: true,
-                DirectoryPath: Path.GetFullPath(directory),
+                DirectoryPath: normalizedDirectory,
                 Diagnostic: null);
         }
         catch (Exception exception) when (
@@ -38,4 +50,19 @@ public sealed record RegionCorpusConfiguration(
         DirectoryPath: null,
         Diagnostic: diagnostic);
 
+    private static bool IsNetworkPath(string path)
+    {
+        var normalizedSeparators = path.Replace('/', '\\');
+        if (normalizedSeparators.StartsWith(@"\\?\UNC\", StringComparison.OrdinalIgnoreCase) ||
+            normalizedSeparators.StartsWith(@"\\.\UNC\", StringComparison.OrdinalIgnoreCase))
+        {
+            return true;
+        }
+
+        // Conventional UNC paths begin with two separators. Local device paths
+        // such as \\?\C:\corpus remain direct local paths and are not rejected.
+        return normalizedSeparators.StartsWith(@"\\", StringComparison.Ordinal) &&
+               !normalizedSeparators.StartsWith(@"\\?\", StringComparison.Ordinal) &&
+               !normalizedSeparators.StartsWith(@"\\.\", StringComparison.Ordinal);
+    }
 }

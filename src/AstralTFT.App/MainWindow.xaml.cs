@@ -37,10 +37,7 @@ public partial class MainWindow : Window, INotifyPropertyChanged
     private const int ShopHudConfirmFrames = 3;
     private const int ShopHudDropFrames = 20;
 
-    private int _shopHudConfirmationFrames;
-    private int _shopHudMissingFrames;
-    private bool _shopHudConfirmed;
-    private string _lastConfirmedShopSummary = "No confirmed shop yet.";
+    private long _captureGeneration;
     private WindowsGraphicsCaptureFrameSource? _captureSource;
     private Task? _captureTask;
     private CancellationTokenSource? _captureSamplerCts;
@@ -167,6 +164,7 @@ public partial class MainWindow : Window, INotifyPropertyChanged
     {
         await StopCaptureAsync(WgcCaptureEndReason.Requested, null);
 
+        var captureGeneration = Interlocked.Increment(ref _captureGeneration);
         var source = new WindowsGraphicsCaptureFrameSource(game, DiagnosticCaptureOptions);
         var benchmark = new CaptureBenchmarkRecorder(
             game,
@@ -214,13 +212,22 @@ public partial class MainWindow : Window, INotifyPropertyChanged
         try
         {
             await source.StartAsync(cancellationToken);
+            if (!IsCurrentCaptureSession(source, captureGeneration))
+                return;
+
             CaptureState = "Capturing TFT window";
             FooterText = corpusRecorder is not null
                 ? "Capture-only benchmark active. Developer replay corpus recording is local and shop-slot-only."
                 : string.IsNullOrWhiteSpace(corpusDiagnostic)
                     ? "Capture-only benchmark active. Metrics will be written automatically to LocalAppData\\AstralTFT\\Diagnostics."
                     : $"Developer replay corpus disabled: {corpusDiagnostic}";
-            _captureTask = ConsumeFramesAsync(source, benchmark, changeDetector, corpusRecorder, _shutdown.Token);
+            _captureTask = ConsumeFramesAsync(
+                source,
+                benchmark,
+                changeDetector,
+                corpusRecorder,
+                captureGeneration,
+                _shutdown.Token);
 
             _captureSamplerCts = CancellationTokenSource.CreateLinkedTokenSource(_shutdown.Token);
             _captureSamplerTask = SampleBenchmarkAsync(benchmark, _captureSamplerCts.Token);
@@ -230,15 +237,24 @@ public partial class MainWindow : Window, INotifyPropertyChanged
             source.TelemetryUpdated -= OnCaptureTelemetry;
             source.CaptureFaulted -= OnCaptureFaulted;
             source.CaptureEnded -= OnCaptureEnded;
-            _captureSource = null;
-            _benchmark = null;
-            var detachedRecorder = DetachCorpusRecorder();
-            _capturedHwnd = 0;
+            BoundedRegionCorpusRecorder? detachedRecorder = null;
+            var ownsFailedStart = ReferenceEquals(_captureSource, source);
+            if (ownsFailedStart)
+            {
+                Interlocked.Increment(ref _captureGeneration);
+                _captureSource = null;
+                _benchmark = null;
+                detachedRecorder = DetachCorpusRecorder();
+                _capturedHwnd = 0;
+            }
             if (detachedRecorder is not null)
             {
                 try { await detachedRecorder.DisposeAsync(); } catch { }
             }
-            try { await benchmark.CompleteAsync(WgcCaptureEndReason.StartupFailed); } catch { }
+            if (ownsFailedStart)
+            {
+                try { await benchmark.CompleteAsync(WgcCaptureEndReason.StartupFailed); } catch { }
+            }
             // StartAsync owns failed-start cleanup; avoid a redundant disposal wait.
             throw;
         }
@@ -249,14 +265,21 @@ public partial class MainWindow : Window, INotifyPropertyChanged
         CaptureBenchmarkRecorder benchmark,
         GridLumaRegionChangeDetector changeDetector,
         BoundedRegionCorpusRecorder? corpusRecorder,
+        long captureGeneration,
         CancellationToken cancellationToken)
     {
+        var hudSession = new ShopHudSessionTracker(ShopHudConfirmFrames, ShopHudDropFrames);
+        var lastConfirmedShopSummary = "No confirmed shop yet.";
+
         try
         {
             await foreach (var frame in source.ReadFramesAsync(cancellationToken))
             {
                 using (frame)
                 {
+                    if (!IsCurrentCaptureSession(source, captureGeneration))
+                        return;
+
                     // This is deliberately still recognition-free. We only fingerprint
                     // the CPU-visible shop ROI to measure how many expensive downstream
                     // recognition passes could be suppressed by a tiny sampled luma grid.
@@ -272,6 +295,9 @@ public partial class MainWindow : Window, INotifyPropertyChanged
                     var elapsed = Stopwatch.GetElapsedTime(started);
                     benchmark.RecordRegionChange(change, elapsed);
 
+                    if (!IsCurrentCaptureSession(source, captureGeneration))
+                        return;
+
                     if (frame.NativeFrameHandle is Bgra32FrameBuffer pixels)
                     {
                         // Screen-state detection is separate from slot classification.
@@ -279,55 +305,21 @@ public partial class MainWindow : Window, INotifyPropertyChanged
                         // accepted ROI frame. Full slot recognition still wakes only
                         // when the ROI meaningfully changes.
                         var hud = _shopRecognizer.CheckHud(pixels);
-                        var justConfirmed = false;
-                        var justLost = false;
+                        var decision = hudSession.Observe(hud, change.IsMeaningful);
 
-                        if (hud.IsVisible)
-                        {
-                            _shopHudMissingFrames = 0;
-
-                            if (!_shopHudConfirmed)
-                            {
-                                _shopHudConfirmationFrames++;
-                                if (_shopHudConfirmationFrames >= ShopHudConfirmFrames)
-                                {
-                                    _shopHudConfirmed = true;
-                                    justConfirmed = true;
-                                }
-                            }
-                        }
-                        else if (_shopHudConfirmed && hud.SupportsHold)
-                        {
-                            // Greyed unaffordable units and short HUD animation states
-                            // may weaken the exact frame colors without removing the
-                            // underlying shop. Keep the last confirmed result, but do
-                            // not run a fresh classification from the muted frame.
-                            _shopHudConfirmationFrames = 0;
-                            _shopHudMissingFrames = 0;
-                        }
-                        else
-                        {
-                            _shopHudConfirmationFrames = 0;
-
-                            if (_shopHudConfirmed)
-                            {
-                                _shopHudMissingFrames++;
-                                if (_shopHudMissingFrames >= ShopHudDropFrames)
-                                {
-                                    _shopHudConfirmed = false;
-                                    _shopHudMissingFrames = 0;
-                                    justLost = true;
-                                }
-                            }
-                        }
+                        if (!IsCurrentCaptureSession(source, captureGeneration))
+                            return;
 
                         string? corpusFooterDiagnostic = null;
-                        if (_shopHudConfirmed && hud.IsVisible && change.IsMeaningful)
+                        if (decision.ShouldRecordChangedShop)
                             corpusFooterDiagnostic = TryRecordShopCorpus(frame, corpusRecorder);
 
-                        if (justLost)
+                        if (!IsCurrentCaptureSession(source, captureGeneration))
+                            return;
+
+                        if (decision.JustLost)
                         {
-                            await Dispatcher.InvokeAsync(() =>
+                            await UpdateCaptureSessionUiAsync(source, captureGeneration, () =>
                             {
                                 RecognitionState = "INACTIVE";
                                 RecognitionDetails =
@@ -335,17 +327,15 @@ public partial class MainWindow : Window, INotifyPropertyChanged
                                 FooterText = "Non-shop scene detected; shop recognition is sleeping.";
                             });
                         }
-                        else if (_shopHudConfirmed &&
-                                 hud.IsVisible &&
-                                 (justConfirmed || change.IsMeaningful))
+                        else if (decision.ShouldRecognize)
                         {
                             var shop = _shopRecognizer.Recognize(pixels);
                             var summary = string.Join(
                                 "  •  ",
                                 shop.Slots.Select(FormatShopSlot));
-                            _lastConfirmedShopSummary = summary;
+                            lastConfirmedShopSummary = summary;
 
-                            await Dispatcher.InvokeAsync(() =>
+                            await UpdateCaptureSessionUiAsync(source, captureGeneration, () =>
                             {
                                 RecognitionState = "ACTIVE";
                                 RecognitionDetails = summary;
@@ -354,22 +344,22 @@ public partial class MainWindow : Window, INotifyPropertyChanged
                                     corpusFooterDiagnostic ?? GetCorpusFooterDiagnostic(corpusRecorder));
                             });
                         }
-                        else if (_shopHudConfirmed && !hud.IsVisible)
+                        else if (decision.IsConfirmed && !decision.IsVisible)
                         {
-                            var remaining = Math.Max(0, ShopHudDropFrames - _shopHudMissingFrames);
-                            await Dispatcher.InvokeAsync(() =>
+                            var remaining = Math.Max(0, ShopHudDropFrames - decision.MissingFrames);
+                            await UpdateCaptureSessionUiAsync(source, captureGeneration, () =>
                             {
                                 RecognitionState = "HOLD";
                                 RecognitionDetails =
-                                    $"{_lastConfirmedShopSummary}  •  temporarily holding ({remaining} grace frames)";
+                                    $"{lastConfirmedShopSummary}  •  temporarily holding ({remaining} grace frames)";
                                 FooterText =
                                     "Shop chrome is muted/transitioning • hold-only frame evidence detected • no new shop guess is being made.";
                             });
                         }
-                        else if (!_shopHudConfirmed)
+                        else if (!decision.IsConfirmed)
                         {
-                            var progress = Math.Clamp(_shopHudConfirmationFrames, 0, ShopHudConfirmFrames);
-                            await Dispatcher.InvokeAsync(() =>
+                            var progress = Math.Clamp(decision.VisibleFrames, 0, ShopHudConfirmFrames);
+                            await UpdateCaptureSessionUiAsync(source, captureGeneration, () =>
                             {
                                 RecognitionState = "WAITING";
                                 RecognitionDetails =
@@ -386,12 +376,30 @@ public partial class MainWindow : Window, INotifyPropertyChanged
         }
         catch (Exception ex)
         {
-            await Dispatcher.InvokeAsync(() =>
+            await UpdateCaptureSessionUiAsync(source, captureGeneration, () =>
             {
                 CaptureState = "Capture consumer fault";
                 FooterText = $"Capture consumer error: {ex.GetType().Name}: {ex.Message}";
             });
         }
+    }
+
+    private bool IsCurrentCaptureSession(
+        WindowsGraphicsCaptureFrameSource source,
+        long captureGeneration) =>
+        captureGeneration == Interlocked.Read(ref _captureGeneration) &&
+        ReferenceEquals(source, _captureSource);
+
+    private async Task UpdateCaptureSessionUiAsync(
+        WindowsGraphicsCaptureFrameSource source,
+        long captureGeneration,
+        Action update)
+    {
+        await Dispatcher.InvokeAsync(() =>
+        {
+            if (IsCurrentCaptureSession(source, captureGeneration))
+                update();
+        });
     }
 
     private string? TryRecordShopCorpus(
@@ -408,12 +416,12 @@ public partial class MainWindow : Window, INotifyPropertyChanged
 
             try
             {
-                _ = ShopSlotCorpusCapture.TryRecordChangedShop(frame, corpusRecorder);
-                return GetCorpusFooterDiagnostic(corpusRecorder);
+                var result = ShopSlotCorpusCapture.TryRecordChangedShop(frame, corpusRecorder);
+                return result.Diagnostic ?? GetCorpusFooterDiagnostic(corpusRecorder);
             }
-            catch (Exception exception)
+            catch (Exception)
             {
-                return $"Developer replay corpus capture failed ({exception.GetType().Name}).";
+                return "Developer replay corpus capture failed.";
             }
         }
     }
@@ -471,9 +479,21 @@ public partial class MainWindow : Window, INotifyPropertyChanged
 
     private void OnCaptureTelemetry(object? sender, WgcCaptureTelemetry telemetry)
     {
-        _benchmark?.RecordTelemetry(telemetry);
+        var source = sender as WindowsGraphicsCaptureFrameSource;
+        var captureGeneration = Interlocked.Read(ref _captureGeneration);
+        if (source is null || !IsCurrentCaptureSession(source, captureGeneration))
+            return;
+
+        var benchmark = _benchmark;
+        if (benchmark is null)
+            return;
+
+        benchmark.RecordTelemetry(telemetry);
         _ = Dispatcher.BeginInvoke(() =>
         {
+            if (!IsCurrentCaptureSession(source, captureGeneration))
+                return;
+
             var elapsed = DateTimeOffset.UtcNow - _captureStartedAt;
             var readbackRate = elapsed.TotalSeconds > 0.25
                 ? telemetry.FramesReadBack / elapsed.TotalSeconds
@@ -500,8 +520,16 @@ public partial class MainWindow : Window, INotifyPropertyChanged
 
     private void OnCaptureFaulted(object? sender, Exception ex)
     {
+        var source = sender as WindowsGraphicsCaptureFrameSource;
+        var captureGeneration = Interlocked.Read(ref _captureGeneration);
+        if (source is null || !IsCurrentCaptureSession(source, captureGeneration))
+            return;
+
         _ = Dispatcher.BeginInvoke(() =>
         {
+            if (!IsCurrentCaptureSession(source, captureGeneration))
+                return;
+
             CaptureState = "Capture degraded";
             FooterText = $"WGC error isolated: {ex.GetType().Name}: {ex.Message}";
         });
@@ -510,12 +538,20 @@ public partial class MainWindow : Window, INotifyPropertyChanged
     private void OnCaptureEnded(object? sender, WgcCaptureEndedEventArgs args)
     {
         if (args.Reason == WgcCaptureEndReason.Requested) return;
-        _ = Dispatcher.BeginInvoke(() => _ = HandleUnexpectedCaptureEndAsync(sender as WindowsGraphicsCaptureFrameSource, args));
+        var source = sender as WindowsGraphicsCaptureFrameSource;
+        var captureGeneration = Interlocked.Read(ref _captureGeneration);
+        if (source is null || !IsCurrentCaptureSession(source, captureGeneration))
+            return;
+
+        _ = Dispatcher.BeginInvoke(() => _ = HandleUnexpectedCaptureEndAsync(source, args, captureGeneration));
     }
 
-    private async Task HandleUnexpectedCaptureEndAsync(WindowsGraphicsCaptureFrameSource? source, WgcCaptureEndedEventArgs args)
+    private async Task HandleUnexpectedCaptureEndAsync(
+        WindowsGraphicsCaptureFrameSource source,
+        WgcCaptureEndedEventArgs args,
+        long captureGeneration)
     {
-        if (source is null || !ReferenceEquals(source, _captureSource)) return;
+        if (!IsCurrentCaptureSession(source, captureGeneration)) return;
         CaptureState = args.Reason == WgcCaptureEndReason.DeviceLost ? "GPU capture restarting…" : "Capture ended";
         FooterText = args.Error is null
             ? $"Capture ended: {args.Reason}. Window discovery will reattach if TFT is still running."
@@ -530,16 +566,11 @@ public partial class MainWindow : Window, INotifyPropertyChanged
         var samplerCts = _captureSamplerCts;
         var samplerTask = _captureSamplerTask;
         var captureTask = _captureTask;
-        var corpusRecorder = DetachCorpusRecorder();
 
-        _captureSource = null;
-        _benchmark = null;
-        _captureSamplerCts = null;
-        _captureSamplerTask = null;
-        _captureTask = null;
-        _capturedHwnd = 0;
-
-        if (source is null && benchmark is null && corpusRecorder is null) return;
+        // Invalidate every source callback before detaching the recorder. The
+        // producer gate below then makes old-frame corpus submissions fail before
+        // the recorder begins its independent drain.
+        Interlocked.Increment(ref _captureGeneration);
 
         if (source is not null)
         {
@@ -549,48 +580,26 @@ public partial class MainWindow : Window, INotifyPropertyChanged
         }
 
         try { samplerCts?.Cancel(); } catch { }
-        var captureConsumerStopped = source is null;
-        if (source is not null)
-        {
-            // StopAsync requests shutdown immediately, then waits for any in-flight
-            // D3D readback to relinquish its resources. Bound the UI wait without
-            // forcing unsafe disposal underneath a potentially stuck GPU callback;
-            // the source continues deferred cleanup in the background if necessary.
-            using var stopWait = new CancellationTokenSource(TimeSpan.FromSeconds(5));
-            try
-            {
-                await source.StopAsync(stopWait.Token);
-                captureConsumerStopped = true;
-            }
-            catch (OperationCanceledException) when (stopWait.IsCancellationRequested)
-            {
-                FooterText = "Capture stop is waiting on the graphics driver; safe deferred cleanup is continuing in the background.";
-            }
-            catch
-            {
-                // Capture source reports faults through its own telemetry/events.
-            }
-        }
+        _captureSource = null;
+        _benchmark = null;
+        _captureSamplerCts = null;
+        _captureSamplerTask = null;
+        _captureTask = null;
+        _capturedHwnd = 0;
 
-        if (captureTask is not null && captureConsumerStopped)
+        var corpusRecorder = DetachCorpusRecorder();
+        // Begin this retained task immediately after detachment. The coordinator
+        // starts DisposeAsync before it waits for WGC, awaits the frame consumer on
+        // a normal stop, and still awaits corpus draining after a driver timeout.
+        var corpusStopAndDrainTask = ReplayCorpusStopCoordinator.StopAndDrainAsync(
+            corpusRecorder,
+            captureTask,
+            source is null ? null : token => source.StopAsync(token).AsTask(),
+            TimeSpan.FromSeconds(5));
+        var corpusStopResult = await corpusStopAndDrainTask;
+        if (corpusStopResult.SourceStopTimedOut)
         {
-            try { await captureTask; } catch { }
-        }
-
-        if (corpusRecorder is not null)
-        {
-            if (captureTask is not null && !captureConsumerStopped)
-            {
-                // The recorder was detached under the producer gate before source
-                // shutdown began. If WGC's driver-safe stop is still deferred, keep
-                // the recorder alive until its consumer exits, then drain it without
-                // letting stale frames submit to a later attachment's recorder.
-                _ = DrainCorpusAfterConsumerAsync(captureTask, corpusRecorder);
-            }
-            else
-            {
-                try { await corpusRecorder.DisposeAsync(); } catch { }
-            }
+            FooterText = "Capture stop is waiting on the graphics driver; accepted local replay corpus work was drained.";
         }
 
         if (samplerTask is not null)
@@ -612,14 +621,6 @@ public partial class MainWindow : Window, INotifyPropertyChanged
                 FooterText = $"Capture stopped; benchmark export failed: {ex.GetType().Name}: {ex.Message}";
             }
         }
-    }
-
-    private static async Task DrainCorpusAfterConsumerAsync(
-        Task captureTask,
-        BoundedRegionCorpusRecorder corpusRecorder)
-    {
-        try { await captureTask.ConfigureAwait(false); } catch { }
-        try { await corpusRecorder.DisposeAsync().ConfigureAwait(false); } catch { }
     }
 
     private async void OnClosing(object? sender, CancelEventArgs e)

@@ -80,8 +80,12 @@ var tests = new (string Name, Action Run)[]
     ("Corpus recorder drains accepted snapshots", CorpusRecorderDrainsAcceptedSnapshots),
     ("Corpus recorder isolates sink failures", CorpusRecorderIsolatesSinkFailures),
     ("Corpus recorder stops acceptance while draining", CorpusRecorderStopsAcceptanceWhileDraining),
+    ("Corpus recorder drains while capture stop is deferred", CorpusRecorderDrainsWhileCaptureStopIsDeferred),
     ("Corpus configuration requires an absolute directory", CorpusConfigurationRequiresAbsolutePath),
+    ("Corpus configuration rejects network directories", CorpusConfigurationRejectsNetworkDirectories),
+    ("Shop HUD confirmation is scoped to one capture session", ShopHudSessionDoesNotReuseConfirmation),
     ("Shop corpus capture submits packed slot snapshots", ShopCorpusCaptureSubmitsPackedSlots),
+    ("Shop corpus capture isolates one slot failure", ShopCorpusCaptureIsolatesOneSlotFailure),
 };
 
 var failures = new List<string>();
@@ -739,6 +743,53 @@ static void CorpusConfigurationRequiresAbsolutePath()
     True(!Directory.Exists(absolutePath), "Parsing corpus configuration must not create a directory.");
 }
 
+static void CorpusConfigurationRejectsNetworkDirectories()
+{
+    string[] networkDirectories =
+    [
+        @"\\server\share\astraltft-corpus",
+        "//server/share/astraltft-corpus",
+        @"\\?\UNC\server\share\astraltft-corpus",
+        "//?/UNC/server/share/astraltft-corpus",
+    ];
+
+    foreach (var directory in networkDirectories)
+    {
+        var configuration = RegionCorpusConfiguration.FromEnvironmentValue(directory);
+        True(!configuration.Enabled, "Network corpus directories must be rejected.");
+        True(configuration.DirectoryPath is null, "Rejected network directories must not select a corpus directory.");
+        Equal("Corpus directory must be a direct local path.", configuration.Diagnostic);
+        True(!configuration.Diagnostic!.Any(char.IsControl), "Network path diagnostics must be safe for a one-line footer.");
+    }
+}
+
+static void ShopHudSessionDoesNotReuseConfirmation()
+{
+    var visibleMeaningfulHud = new ShopHudObservation(
+        IsVisible: true,
+        SupportsHold: false,
+        Confidence: 1,
+        TopBorderMatches: 5,
+        SeparatorMatches: 4);
+    var priorSession = new ShopHudSessionTracker(confirmationFrames: 3, dropFrames: 20);
+
+    priorSession.Observe(visibleMeaningfulHud, isMeaningfulChange: true);
+    priorSession.Observe(visibleMeaningfulHud, isMeaningfulChange: true);
+    var priorConfirmed = priorSession.Observe(visibleMeaningfulHud, isMeaningfulChange: true);
+    True(priorConfirmed.IsConfirmed, "The prior session should confirm after three visible observations.");
+
+    var freshSession = new ShopHudSessionTracker(confirmationFrames: 3, dropFrames: 20);
+    var firstFreshObservation = freshSession.Observe(visibleMeaningfulHud, isMeaningfulChange: true);
+    var secondFreshObservation = freshSession.Observe(visibleMeaningfulHud, isMeaningfulChange: true);
+
+    True(!firstFreshObservation.IsConfirmed, "A fresh session must not inherit a prior session confirmation.");
+    True(!firstFreshObservation.ShouldRecordChangedShop, "A fresh session's first observation must not record corpus data.");
+    True(!firstFreshObservation.ShouldRecognize, "A fresh session's first observation must not invoke live recognition.");
+    True(!secondFreshObservation.IsConfirmed, "A fresh session must remain unconfirmed on its second visible observation.");
+    True(!secondFreshObservation.ShouldRecordChangedShop, "A fresh session's second observation must not record corpus data.");
+    True(!secondFreshObservation.ShouldRecognize, "A fresh session's second observation must not invoke live recognition.");
+}
+
 static void ShopCorpusCaptureSubmitsPackedSlots()
 {
     const int width = 1152;
@@ -771,7 +822,10 @@ static void ShopCorpusCaptureSubmitsPackedSlots()
 
     try
     {
-        Equal(5, ShopSlotCorpusCapture.TryRecordChangedShop(frame, recorder));
+        var capture = ShopSlotCorpusCapture.TryRecordChangedShop(frame, recorder);
+        Equal(5, capture.AcceptedCount);
+        Equal(0, capture.FailedSlotCount);
+        True(capture.Diagnostic is null, "Successful slot capture must not report a diagnostic.");
         recorder.DisposeAsync().AsTask().GetAwaiter().GetResult();
 
         var slots = ShopSlotRecognizer.ProjectSlots(width, height);
@@ -799,6 +853,47 @@ static void ShopCorpusCaptureSubmitsPackedSlots()
                 pixels.AsSpan(sourceLastPixel, 4).SequenceEqual(request.Pixels.AsSpan(copiedLastPixel, 4)),
                 $"Slot {index + 1} must copy its last BGRA pixel from the padded source frame.");
         }
+    }
+    finally
+    {
+        recorder.DisposeAsync().AsTask().GetAwaiter().GetResult();
+    }
+}
+
+static void ShopCorpusCaptureIsolatesOneSlotFailure()
+{
+    const int width = 1152;
+    const int height = 239;
+    const int stride = width * 4 + 32;
+    var pixels = new byte[stride * height];
+    Array.Fill(pixels, (byte)0x6A);
+    var capturedAt = new DateTimeOffset(2026, 8, 28, 12, 45, 0, TimeSpan.Zero);
+    using var frame = new CapturedFrame(
+        Sequence: 1234,
+        CapturedAt: capturedAt,
+        Width: width,
+        Height: height,
+        NativeFrameHandle: new Bgra32FrameBuffer(width, height, stride, pixels));
+    var sink = new CollectingCorpusSink();
+    var recorder = new BoundedRegionCorpusRecorder(sink, capacity: 16);
+    var factory = new FailingShopSlotSnapshotFactory("shop-slot-3");
+
+    try
+    {
+        var capture = ShopSlotCorpusCapture.TryRecordChangedShop(frame, recorder, factory);
+
+        Equal(4, capture.AcceptedCount);
+        Equal(1, capture.FailedSlotCount);
+        Equal("Developer replay corpus skipped one or more shop slots.", capture.Diagnostic);
+        True(!capture.Diagnostic!.Contains("injected", StringComparison.OrdinalIgnoreCase), "Slot diagnostics must not expose exception messages.");
+        True(!capture.Diagnostic.Any(char.IsControl), "Slot diagnostics must be safe for a one-line footer.");
+
+        recorder.DisposeAsync().AsTask().GetAwaiter().GetResult();
+        Equal(4, sink.Requests.Count);
+        True(sink.Requests.All(request => request.RegionId != "shop-slot-3"), "The failed slot must not prevent the other slots from enqueueing.");
+        Equal(4, factory.CreatedSnapshots.Count);
+        foreach (var snapshot in factory.CreatedSnapshots)
+            Throws<ObjectDisposedException>(() => _ = snapshot.Pixels);
     }
     finally
     {
@@ -986,6 +1081,51 @@ static void CorpusRecorderStopsAcceptanceWhileDraining()
         recorder.DisposeAsync().AsTask().GetAwaiter().GetResult();
         first.Dispose();
         rejected.Dispose();
+    }
+}
+
+static void CorpusRecorderDrainsWhileCaptureStopIsDeferred()
+{
+    var sink = new BlockingCorpusSink();
+    var recorder = new BoundedRegionCorpusRecorder(sink, capacity: 1);
+    var snapshot = CorpusSnapshot("shop-slot-1", 101, new byte[] { 1, 2, 3, 255, 4, 5, 6, 255 });
+    var sourceStopEntered = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+    var deferredCaptureConsumer = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+
+    try
+    {
+        True(recorder.TryRecord(snapshot, RegionCorpusSourceKind.LiveCapture), "Accepted corpus work should start before the capture-source stop is requested.");
+        sink.WaitForFirstWrite();
+
+        Task DeferredSourceStopAsync(CancellationToken cancellationToken)
+        {
+            sourceStopEntered.TrySetResult();
+            return Task.Delay(Timeout.InfiniteTimeSpan, cancellationToken);
+        }
+
+        var shutdown = ReplayCorpusStopCoordinator.StopAndDrainAsync(
+            recorder,
+            deferredCaptureConsumer.Task,
+            DeferredSourceStopAsync,
+            TimeSpan.FromMilliseconds(50));
+        sourceStopEntered.Task.GetAwaiter().GetResult();
+
+        True(!shutdown.IsCompleted, "Shutdown must wait for accepted corpus work while the source stop is deferred.");
+        True(!recorder.TryRecord(snapshot, RegionCorpusSourceKind.LiveCapture), "A detached recorder must reject stale producers while draining.");
+
+        sink.ReleaseFirstWrite();
+        var result = shutdown.WaitAsync(TimeSpan.FromSeconds(2)).GetAwaiter().GetResult();
+
+        True(result.SourceStopTimedOut, "The modeled graphics-source stop must report its timeout.");
+        True(!result.CaptureConsumerStopped, "A timed-out source stop must not be reported as a stopped consumer.");
+        True(!deferredCaptureConsumer.Task.IsCompleted, "A timed-out source stop must not make recorder draining wait for an unresolved consumer.");
+        Equal(1L, recorder.Metrics.Written);
+    }
+    finally
+    {
+        sink.ReleaseFirstWrite();
+        recorder.DisposeAsync().AsTask().GetAwaiter().GetResult();
+        snapshot.Dispose();
     }
 }
 
@@ -1761,6 +1901,23 @@ sealed class CollectingCorpusSink : IRegionCorpusSink
     {
         Requests.Add(request);
         return ValueTask.FromResult(new RegionCorpusWriteResult("test", BlobCreated: true));
+    }
+}
+
+sealed class FailingShopSlotSnapshotFactory(string failedRegionId) : IRegionSnapshotFactory
+{
+    private readonly CpuBgraRegionSnapshotFactory _inner = new();
+
+    public List<Bgra32RegionSnapshot> CreatedSnapshots { get; } = [];
+
+    public IRegionSnapshot Create(CapturedFrame frame, RegionOfInterest region)
+    {
+        if (region.Id == failedRegionId)
+            throw new InvalidOperationException("injected\r\nshop-slot failure");
+
+        var snapshot = (Bgra32RegionSnapshot)_inner.Create(frame, region);
+        CreatedSnapshots.Add(snapshot);
+        return snapshot;
     }
 }
 
