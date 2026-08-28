@@ -76,6 +76,10 @@ var tests = new (string Name, Action Run)[]
     ("Corpus reader normalizes a missing blob directory", CorpusReaderNormalizesMissingBlobDirectory),
     ("Corpus reader rejects newline-terminated trailing JSON comma", CorpusReaderRejectsTerminatedTrailingJsonComma),
     ("Corpus reader rejects newline-terminated unterminated JSON string", CorpusReaderRejectsTerminatedUnterminatedJsonString),
+    ("Corpus recorder rejects full queue without blocking", CorpusRecorderRejectsFullQueue),
+    ("Corpus recorder drains accepted snapshots", CorpusRecorderDrainsAcceptedSnapshots),
+    ("Corpus recorder isolates sink failures", CorpusRecorderIsolatesSinkFailures),
+    ("Corpus recorder stops acceptance while draining", CorpusRecorderStopsAcceptanceWhileDraining),
 };
 
 var failures = new List<string>();
@@ -756,6 +760,147 @@ static void CorpusStoreDeduplicatesBlobs()
     Equal(2, File.ReadLines(Path.Combine(temporary.Path, "observations.jsonl")).Count());
     Equal(1, Directory.EnumerateFiles(Path.Combine(temporary.Path, "blobs"), "*.bgra").Count());
 }
+
+static void CorpusRecorderRejectsFullQueue()
+{
+    var sink = new BlockingCorpusSink();
+    var recorder = new BoundedRegionCorpusRecorder(sink, capacity: 1);
+    var pixels = new byte[] { 1, 2, 3, 255, 4, 5, 6, 255 };
+    var first = CorpusSnapshot("shop-slot-1", 101, pixels);
+    var second = CorpusSnapshot("shop-slot-2", 102, new byte[] { 7, 8, 9, 255, 10, 11, 12, 255 });
+    var third = CorpusSnapshot("shop-slot-3", 103, new byte[] { 13, 14, 15, 255, 16, 17, 18, 255 });
+
+    try
+    {
+        True(recorder.TryRecord(first, RegionCorpusSourceKind.LiveCapture), "First snapshot should be accepted.");
+        sink.WaitForFirstWrite();
+        pixels[0] = 99;
+        True(recorder.TryRecord(second, RegionCorpusSourceKind.LiveCapture), "One queued snapshot should be accepted.");
+        True(!recorder.TryRecord(third, RegionCorpusSourceKind.LiveCapture), "A full recorder must reject without waiting.");
+
+        sink.ReleaseFirstWrite();
+        recorder.DisposeAsync().AsTask().GetAwaiter().GetResult();
+
+        var metrics = recorder.Metrics;
+        Equal(2L, metrics.Accepted);
+        Equal(1L, metrics.Dropped);
+        Equal(2L, metrics.Written);
+        Equal(0L, metrics.Pending);
+        Equal((byte)1, sink.Requests[0].Pixels[0]);
+    }
+    finally
+    {
+        sink.ReleaseFirstWrite();
+        recorder.DisposeAsync().AsTask().GetAwaiter().GetResult();
+        first.Dispose();
+        second.Dispose();
+        third.Dispose();
+    }
+}
+
+static void CorpusRecorderDrainsAcceptedSnapshots()
+{
+    var sink = new SequencedCorpusSink(
+        new RegionCorpusWriteResult("first", BlobCreated: true),
+        new RegionCorpusWriteResult("first", BlobCreated: false));
+    var recorder = new BoundedRegionCorpusRecorder(sink, capacity: 2);
+    var first = CorpusSnapshot("shop-slot-1", 101, new byte[] { 1, 2, 3, 255, 4, 5, 6, 255 });
+    var second = CorpusSnapshot("shop-slot-2", 102, new byte[] { 1, 2, 3, 255, 4, 5, 6, 255 });
+
+    try
+    {
+        True(recorder.TryRecord(first, RegionCorpusSourceKind.LiveCapture), "First snapshot should be accepted.");
+        True(recorder.TryRecord(second, RegionCorpusSourceKind.ImportedFrame), "Second snapshot should be accepted.");
+        recorder.DisposeAsync().AsTask().GetAwaiter().GetResult();
+
+        var metrics = recorder.Metrics;
+        Equal(2L, metrics.Accepted);
+        Equal(0L, metrics.Dropped);
+        Equal(2L, metrics.Written);
+        Equal(1L, metrics.Deduplicated);
+        Equal(0L, metrics.Failed);
+        Equal(0L, metrics.Pending);
+        Equal(2, sink.Requests.Count);
+    }
+    finally
+    {
+        recorder.DisposeAsync().AsTask().GetAwaiter().GetResult();
+        first.Dispose();
+        second.Dispose();
+    }
+}
+
+static void CorpusRecorderIsolatesSinkFailures()
+{
+    var sink = new FailingThenSuccessfulCorpusSink();
+    var recorder = new BoundedRegionCorpusRecorder(sink, capacity: 2);
+    var first = CorpusSnapshot("shop-slot-1", 101, new byte[] { 1, 2, 3, 255, 4, 5, 6, 255 });
+    var second = CorpusSnapshot("shop-slot-2", 102, new byte[] { 7, 8, 9, 255, 10, 11, 12, 255 });
+
+    try
+    {
+        True(recorder.TryRecord(first, RegionCorpusSourceKind.LiveCapture), "Failing work should still be accepted.");
+        True(recorder.TryRecord(second, RegionCorpusSourceKind.LiveCapture), "Work after a sink failure should be accepted.");
+        recorder.DisposeAsync().AsTask().GetAwaiter().GetResult();
+
+        var metrics = recorder.Metrics;
+        Equal(2L, metrics.Accepted);
+        Equal(1L, metrics.Written);
+        Equal(1L, metrics.Failed);
+        Equal(0L, metrics.Pending);
+        Equal("InvalidOperationException: intentional failure", metrics.LastDiagnostic);
+        Equal(2, sink.WriteCount);
+    }
+    finally
+    {
+        recorder.DisposeAsync().AsTask().GetAwaiter().GetResult();
+        first.Dispose();
+        second.Dispose();
+    }
+}
+
+static void CorpusRecorderStopsAcceptanceWhileDraining()
+{
+    var sink = new BlockingCorpusSink();
+    var recorder = new BoundedRegionCorpusRecorder(sink, capacity: 1);
+    var first = CorpusSnapshot("shop-slot-1", 101, new byte[] { 1, 2, 3, 255, 4, 5, 6, 255 });
+    var rejected = CorpusSnapshot("shop-slot-2", 102, new byte[] { 7, 8, 9, 255, 10, 11, 12, 255 });
+
+    try
+    {
+        True(recorder.TryRecord(first, RegionCorpusSourceKind.LiveCapture), "Initial snapshot should be accepted.");
+        sink.WaitForFirstWrite();
+        var firstDispose = recorder.DisposeAsync().AsTask();
+        var secondDispose = recorder.DisposeAsync().AsTask();
+        True(!firstDispose.IsCompleted, "Dispose must wait for already-accepted work to drain.");
+        True(!recorder.TryRecord(rejected, RegionCorpusSourceKind.LiveCapture), "Recorder must stop acceptance during disposal.");
+
+        sink.ReleaseFirstWrite();
+        Task.WhenAll(firstDispose, secondDispose).GetAwaiter().GetResult();
+
+        var metrics = recorder.Metrics;
+        Equal(1L, metrics.Accepted);
+        Equal(1L, metrics.Dropped);
+        Equal(1L, metrics.Written);
+        Equal(0L, metrics.Pending);
+    }
+    finally
+    {
+        sink.ReleaseFirstWrite();
+        recorder.DisposeAsync().AsTask().GetAwaiter().GetResult();
+        first.Dispose();
+        rejected.Dispose();
+    }
+}
+
+static Bgra32RegionSnapshot CorpusSnapshot(string regionId, long sequence, byte[] pixels) => new(
+    regionId,
+    sequence,
+    new DateTimeOffset(2026, 8, 28, 12, 0, 0, TimeSpan.Zero).AddMilliseconds(sequence),
+    width: 2,
+    height: 1,
+    stride: 8,
+    pixels);
 
 static void CorpusReaderRejectsHashMismatch()
 {
@@ -1462,6 +1607,68 @@ sealed class TrackingDisposable : IDisposable
 {
     public bool IsDisposed { get; private set; }
     public void Dispose() => IsDisposed = true;
+}
+
+sealed class BlockingCorpusSink : IRegionCorpusSink
+{
+    private readonly TaskCompletionSource _firstWriteEntered = new(TaskCreationOptions.RunContinuationsAsynchronously);
+    private readonly TaskCompletionSource _releaseFirstWrite = new(TaskCreationOptions.RunContinuationsAsynchronously);
+    private int _writeCount;
+
+    public List<RegionCorpusWriteRequest> Requests { get; } = [];
+
+    public ValueTask<RegionCorpusWriteResult> WriteAsync(
+        RegionCorpusWriteRequest request,
+        CancellationToken cancellationToken = default)
+    {
+        Requests.Add(request);
+        if (Interlocked.Increment(ref _writeCount) != 1)
+            return ValueTask.FromResult(new RegionCorpusWriteResult("later", BlobCreated: true));
+
+        _firstWriteEntered.TrySetResult();
+        return WaitForReleaseAsync();
+    }
+
+    public void WaitForFirstWrite() => _firstWriteEntered.Task.GetAwaiter().GetResult();
+
+    public void ReleaseFirstWrite() => _releaseFirstWrite.TrySetResult();
+
+    private async ValueTask<RegionCorpusWriteResult> WaitForReleaseAsync()
+    {
+        await _releaseFirstWrite.Task.ConfigureAwait(false);
+        return new RegionCorpusWriteResult("first", BlobCreated: true);
+    }
+}
+
+sealed class SequencedCorpusSink(params RegionCorpusWriteResult[] results) : IRegionCorpusSink
+{
+    private readonly Queue<RegionCorpusWriteResult> _results = new(results);
+
+    public List<RegionCorpusWriteRequest> Requests { get; } = [];
+
+    public ValueTask<RegionCorpusWriteResult> WriteAsync(
+        RegionCorpusWriteRequest request,
+        CancellationToken cancellationToken = default)
+    {
+        Requests.Add(request);
+        return ValueTask.FromResult(_results.Dequeue());
+    }
+}
+
+sealed class FailingThenSuccessfulCorpusSink : IRegionCorpusSink
+{
+    public int WriteCount { get; private set; }
+
+    public ValueTask<RegionCorpusWriteResult> WriteAsync(
+        RegionCorpusWriteRequest request,
+        CancellationToken cancellationToken = default)
+    {
+        WriteCount++;
+        if (WriteCount == 1)
+            throw new InvalidOperationException("intentional\r\nfailure");
+
+        return ValueTask.FromResult(new RegionCorpusWriteResult("second", BlobCreated: true));
+    }
 }
 
 sealed class FakeFrameSource : IFrameSource
