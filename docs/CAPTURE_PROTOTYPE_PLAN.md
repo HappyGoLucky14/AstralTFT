@@ -65,3 +65,12 @@ Recognition backlog is bounded in two places:
 2. `CoalescingRecognitionQueue` keeps only the newest pending snapshot for each detector/region pair and refuses lower-priority work rather than evicting a more important augment/shop decision.
 
 `DetectorHealthTracker` circuit-breaks a failing recognizer independently, while `RecognitionResultSequenceGate` prevents slow old worker results from overwriting newer state. This is intentionally designed before WGC interop so native frame lifetime and back-pressure cannot become accidental implementation details later.
+
+## Developer replay corpus
+
+The replay corpus is an opt-in local developer switch. It records only the five projected shop slots after a confirmed, meaningful shop change; it does not capture the desktop, game memory, input, opponent data, or network traffic. Developer-mode pixel copies and local I/O may add overhead.
+
+```powershell
+$env:ASTRALTFT_CORPUS_DIRECTORY = 'D:\AstralTFT-Corpus\set18-shop'
+dotnet run --project .\src\AstralTFT.App\AstralTFT.App.csproj -c Release
+```

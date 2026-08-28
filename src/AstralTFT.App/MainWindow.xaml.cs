@@ -7,6 +7,7 @@ using AstralTFT.App.Diagnostics;
 using AstralTFT.Capture.Abstractions;
 using AstralTFT.Capture.Regions;
 using AstralTFT.Capture.Recognition;
+using AstralTFT.Capture.Replay;
 using AstralTFT.Capture.Windows;
 
 namespace AstralTFT.App;
@@ -32,6 +33,7 @@ public partial class MainWindow : Window, INotifyPropertyChanged
     private readonly TftWindowLocator _locator = new();
     private readonly ShopSlotRecognizer _shopRecognizer = new();
     private readonly CancellationTokenSource _shutdown = new();
+    private readonly object _corpusRecorderGate = new();
     private const int ShopHudConfirmFrames = 3;
     private const int ShopHudDropFrames = 20;
 
@@ -44,6 +46,7 @@ public partial class MainWindow : Window, INotifyPropertyChanged
     private CancellationTokenSource? _captureSamplerCts;
     private Task? _captureSamplerTask;
     private CaptureBenchmarkRecorder? _benchmark;
+    private BoundedRegionCorpusRecorder? _corpusRecorder;
     private nint _capturedHwnd;
     private bool _everAttached;
     private int _missingAfterAttachCount;
@@ -177,11 +180,32 @@ public partial class MainWindow : Window, INotifyPropertyChanged
             ShopChangeGridColumns,
             ShopChangeGridRows,
             ShopMeaningfulChangeThreshold);
+        var corpusConfiguration = RegionCorpusConfiguration.FromEnvironmentValue(
+            Environment.GetEnvironmentVariable("ASTRALTFT_CORPUS_DIRECTORY"));
+        BoundedRegionCorpusRecorder? corpusRecorder = null;
+        var corpusDiagnostic = corpusConfiguration.Diagnostic;
+        if (corpusConfiguration.Enabled)
+        {
+            try
+            {
+                var store = new RegionCorpusStore(
+                    corpusConfiguration.DirectoryPath!,
+                    typeof(MainWindow).Assembly.GetName().Version?.ToString() ?? "unknown");
+                corpusRecorder = new BoundedRegionCorpusRecorder(store);
+            }
+            catch (Exception exception)
+            {
+                corpusDiagnostic = $"Corpus store initialization failed ({exception.GetType().Name}).";
+            }
+        }
+
         source.TelemetryUpdated += OnCaptureTelemetry;
         source.CaptureFaulted += OnCaptureFaulted;
         source.CaptureEnded += OnCaptureEnded;
         _captureSource = source;
         _benchmark = benchmark;
+        lock (_corpusRecorderGate)
+            _corpusRecorder = corpusRecorder;
         _capturedHwnd = game.Hwnd;
         _captureStartedAt = DateTimeOffset.UtcNow;
         CaptureState = "Starting…";
@@ -191,8 +215,12 @@ public partial class MainWindow : Window, INotifyPropertyChanged
         {
             await source.StartAsync(cancellationToken);
             CaptureState = "Capturing TFT window";
-            FooterText = "Capture-only benchmark active. Metrics will be written automatically to LocalAppData\\AstralTFT\\Diagnostics.";
-            _captureTask = ConsumeFramesAsync(source, benchmark, changeDetector, _shutdown.Token);
+            FooterText = corpusRecorder is not null
+                ? "Capture-only benchmark active. Developer replay corpus recording is local and shop-slot-only."
+                : string.IsNullOrWhiteSpace(corpusDiagnostic)
+                    ? "Capture-only benchmark active. Metrics will be written automatically to LocalAppData\\AstralTFT\\Diagnostics."
+                    : $"Developer replay corpus disabled: {corpusDiagnostic}";
+            _captureTask = ConsumeFramesAsync(source, benchmark, changeDetector, corpusRecorder, _shutdown.Token);
 
             _captureSamplerCts = CancellationTokenSource.CreateLinkedTokenSource(_shutdown.Token);
             _captureSamplerTask = SampleBenchmarkAsync(benchmark, _captureSamplerCts.Token);
@@ -204,7 +232,12 @@ public partial class MainWindow : Window, INotifyPropertyChanged
             source.CaptureEnded -= OnCaptureEnded;
             _captureSource = null;
             _benchmark = null;
+            var detachedRecorder = DetachCorpusRecorder();
             _capturedHwnd = 0;
+            if (detachedRecorder is not null)
+            {
+                try { await detachedRecorder.DisposeAsync(); } catch { }
+            }
             try { await benchmark.CompleteAsync(WgcCaptureEndReason.StartupFailed); } catch { }
             // StartAsync owns failed-start cleanup; avoid a redundant disposal wait.
             throw;
@@ -215,6 +248,7 @@ public partial class MainWindow : Window, INotifyPropertyChanged
         WindowsGraphicsCaptureFrameSource source,
         CaptureBenchmarkRecorder benchmark,
         GridLumaRegionChangeDetector changeDetector,
+        BoundedRegionCorpusRecorder? corpusRecorder,
         CancellationToken cancellationToken)
     {
         try
@@ -287,6 +321,10 @@ public partial class MainWindow : Window, INotifyPropertyChanged
                             }
                         }
 
+                        string? corpusFooterDiagnostic = null;
+                        if (_shopHudConfirmed && hud.IsVisible && change.IsMeaningful)
+                            corpusFooterDiagnostic = TryRecordShopCorpus(frame, corpusRecorder);
+
                         if (justLost)
                         {
                             await Dispatcher.InvokeAsync(() =>
@@ -311,8 +349,9 @@ public partial class MainWindow : Window, INotifyPropertyChanged
                             {
                                 RecognitionState = "ACTIVE";
                                 RecognitionDetails = summary;
-                                FooterText =
-                                    $"Shop HUD confirmed ({shop.Hud.TopBorderMatches}/5 top, {shop.Hud.SeparatorMatches}/4 separators) • structural recognition {shop.ProcessingTime.TotalMicroseconds:F1} µs.";
+                                FooterText = WithCorpusFooterDiagnostic(
+                                    $"Shop HUD confirmed ({shop.Hud.TopBorderMatches}/5 top, {shop.Hud.SeparatorMatches}/4 separators) • structural recognition {shop.ProcessingTime.TotalMicroseconds:F1} µs.",
+                                    corpusFooterDiagnostic ?? GetCorpusFooterDiagnostic(corpusRecorder));
                             });
                         }
                         else if (_shopHudConfirmed && !hud.IsVisible)
@@ -353,6 +392,54 @@ public partial class MainWindow : Window, INotifyPropertyChanged
                 FooterText = $"Capture consumer error: {ex.GetType().Name}: {ex.Message}";
             });
         }
+    }
+
+    private string? TryRecordShopCorpus(
+        CapturedFrame frame,
+        BoundedRegionCorpusRecorder? corpusRecorder)
+    {
+        if (corpusRecorder is null)
+            return null;
+
+        lock (_corpusRecorderGate)
+        {
+            if (!ReferenceEquals(_corpusRecorder, corpusRecorder))
+                return null;
+
+            try
+            {
+                _ = ShopSlotCorpusCapture.TryRecordChangedShop(frame, corpusRecorder);
+                return GetCorpusFooterDiagnostic(corpusRecorder);
+            }
+            catch (Exception exception)
+            {
+                return $"Developer replay corpus capture failed ({exception.GetType().Name}).";
+            }
+        }
+    }
+
+    private BoundedRegionCorpusRecorder? DetachCorpusRecorder()
+    {
+        lock (_corpusRecorderGate)
+        {
+            var corpusRecorder = _corpusRecorder;
+            _corpusRecorder = null;
+            return corpusRecorder;
+        }
+    }
+
+    private static string? GetCorpusFooterDiagnostic(BoundedRegionCorpusRecorder? corpusRecorder)
+    {
+        return string.IsNullOrWhiteSpace(corpusRecorder?.Metrics.LastDiagnostic)
+            ? null
+            : "Developer replay corpus writer reported a local storage error.";
+    }
+
+    private static string WithCorpusFooterDiagnostic(string footer, string? corpusDiagnostic)
+    {
+        return string.IsNullOrWhiteSpace(corpusDiagnostic)
+            ? footer
+            : $"{footer} • {corpusDiagnostic}";
     }
 
     private static async Task SampleBenchmarkAsync(CaptureBenchmarkRecorder recorder, CancellationToken cancellationToken)
@@ -443,6 +530,7 @@ public partial class MainWindow : Window, INotifyPropertyChanged
         var samplerCts = _captureSamplerCts;
         var samplerTask = _captureSamplerTask;
         var captureTask = _captureTask;
+        var corpusRecorder = DetachCorpusRecorder();
 
         _captureSource = null;
         _benchmark = null;
@@ -451,7 +539,7 @@ public partial class MainWindow : Window, INotifyPropertyChanged
         _captureTask = null;
         _capturedHwnd = 0;
 
-        if (source is null && benchmark is null) return;
+        if (source is null && benchmark is null && corpusRecorder is null) return;
 
         if (source is not null)
         {
@@ -461,6 +549,7 @@ public partial class MainWindow : Window, INotifyPropertyChanged
         }
 
         try { samplerCts?.Cancel(); } catch { }
+        var captureConsumerStopped = source is null;
         if (source is not null)
         {
             // StopAsync requests shutdown immediately, then waits for any in-flight
@@ -471,6 +560,7 @@ public partial class MainWindow : Window, INotifyPropertyChanged
             try
             {
                 await source.StopAsync(stopWait.Token);
+                captureConsumerStopped = true;
             }
             catch (OperationCanceledException) when (stopWait.IsCancellationRequested)
             {
@@ -482,10 +572,27 @@ public partial class MainWindow : Window, INotifyPropertyChanged
             }
         }
 
-        if (captureTask is not null)
+        if (captureTask is not null && captureConsumerStopped)
         {
-            try { await captureTask.WaitAsync(TimeSpan.FromSeconds(2)); } catch { }
+            try { await captureTask; } catch { }
         }
+
+        if (corpusRecorder is not null)
+        {
+            if (captureTask is not null && !captureConsumerStopped)
+            {
+                // The recorder was detached under the producer gate before source
+                // shutdown began. If WGC's driver-safe stop is still deferred, keep
+                // the recorder alive until its consumer exits, then drain it without
+                // letting stale frames submit to a later attachment's recorder.
+                _ = DrainCorpusAfterConsumerAsync(captureTask, corpusRecorder);
+            }
+            else
+            {
+                try { await corpusRecorder.DisposeAsync(); } catch { }
+            }
+        }
+
         if (samplerTask is not null)
         {
             try { await samplerTask.WaitAsync(TimeSpan.FromSeconds(2)); } catch { }
@@ -505,6 +612,14 @@ public partial class MainWindow : Window, INotifyPropertyChanged
                 FooterText = $"Capture stopped; benchmark export failed: {ex.GetType().Name}: {ex.Message}";
             }
         }
+    }
+
+    private static async Task DrainCorpusAfterConsumerAsync(
+        Task captureTask,
+        BoundedRegionCorpusRecorder corpusRecorder)
+    {
+        try { await captureTask.ConfigureAwait(false); } catch { }
+        try { await corpusRecorder.DisposeAsync().ConfigureAwait(false); } catch { }
     }
 
     private async void OnClosing(object? sender, CancelEventArgs e)

@@ -80,6 +80,8 @@ var tests = new (string Name, Action Run)[]
     ("Corpus recorder drains accepted snapshots", CorpusRecorderDrainsAcceptedSnapshots),
     ("Corpus recorder isolates sink failures", CorpusRecorderIsolatesSinkFailures),
     ("Corpus recorder stops acceptance while draining", CorpusRecorderStopsAcceptanceWhileDraining),
+    ("Corpus configuration requires an absolute directory", CorpusConfigurationRequiresAbsolutePath),
+    ("Shop corpus capture submits packed slot snapshots", ShopCorpusCaptureSubmitsPackedSlots),
 };
 
 var failures = new List<string>();
@@ -708,6 +710,100 @@ static void CorpusContractsRejectUnsafeGeometry()
     Throws<ArgumentOutOfRangeException>(() => RegionCorpusHasher.ComputeHash(0, 1, 4, new byte[4]));
     Throws<ArgumentOutOfRangeException>(() => RegionCorpusHasher.ComputeHash(4097, 1, 4097 * 4, new byte[4097 * 4]));
     Throws<ArgumentException>(() => RegionCorpusHasher.ComputeHash(2, 1, 8, new byte[7]));
+}
+
+static void CorpusConfigurationRequiresAbsolutePath()
+{
+    var disabled = RegionCorpusConfiguration.FromEnvironmentValue("   ");
+    True(!disabled.Enabled, "Blank corpus configuration must disable recording.");
+    True(disabled.DirectoryPath is null, "Blank corpus configuration must not choose a directory.");
+    True(disabled.Diagnostic is null, "Blank corpus configuration must not report an error.");
+
+    var relativePath = "astraltft-relative-corpus-" + Guid.NewGuid().ToString("N");
+    var relative = RegionCorpusConfiguration.FromEnvironmentValue(relativePath);
+    True(!relative.Enabled, "Relative corpus configuration must disable recording.");
+    True(relative.DirectoryPath is null, "Relative corpus configuration must not choose a directory.");
+    True(!string.IsNullOrWhiteSpace(relative.Diagnostic), "Relative corpus configuration must explain why it was rejected.");
+    True(!Directory.Exists(relativePath), "Rejecting a relative corpus directory must not create it.");
+
+    var invalid = RegionCorpusConfiguration.FromEnvironmentValue("C:\\corpus\0invalid");
+    True(!invalid.Enabled, "Invalid corpus configuration must disable recording.");
+    True(!string.IsNullOrWhiteSpace(invalid.Diagnostic), "Invalid corpus configuration must explain why it was rejected.");
+    True(!invalid.Diagnostic!.Any(char.IsControl), "Corpus configuration diagnostics must be safe for a single-line footer.");
+
+    var absolutePath = Path.Combine(Path.GetTempPath(), "astraltft-foundation-corpus-" + Guid.NewGuid().ToString("N"));
+    var enabled = RegionCorpusConfiguration.FromEnvironmentValue($"  {absolutePath}  ");
+    True(enabled.Enabled, "An absolute corpus configuration must enable recording.");
+    Equal(Path.GetFullPath(absolutePath), enabled.DirectoryPath);
+    True(enabled.Diagnostic is null, "Valid corpus configuration must not report an error.");
+    True(!Directory.Exists(absolutePath), "Parsing corpus configuration must not create a directory.");
+}
+
+static void ShopCorpusCaptureSubmitsPackedSlots()
+{
+    const int width = 1152;
+    const int height = 239;
+    const int stride = width * 4 + 32;
+    var pixels = new byte[stride * height];
+    Array.Fill(pixels, (byte)0xCC);
+
+    for (var y = 0; y < height; y++)
+    {
+        for (var x = 0; x < width; x++)
+        {
+            var offset = y * stride + x * 4;
+            pixels[offset] = (byte)((x + y) & 0xFF);
+            pixels[offset + 1] = (byte)((x * 3 + y * 5) & 0xFF);
+            pixels[offset + 2] = (byte)((x * 7 + y * 11) & 0xFF);
+            pixels[offset + 3] = 255;
+        }
+    }
+
+    var capturedAt = new DateTimeOffset(2026, 8, 28, 12, 34, 56, TimeSpan.Zero);
+    using var frame = new CapturedFrame(
+        Sequence: 9876,
+        CapturedAt: capturedAt,
+        Width: width,
+        Height: height,
+        NativeFrameHandle: new Bgra32FrameBuffer(width, height, stride, pixels));
+    var sink = new CollectingCorpusSink();
+    var recorder = new BoundedRegionCorpusRecorder(sink, capacity: 16);
+
+    try
+    {
+        Equal(5, ShopSlotCorpusCapture.TryRecordChangedShop(frame, recorder));
+        recorder.DisposeAsync().AsTask().GetAwaiter().GetResult();
+
+        var slots = ShopSlotRecognizer.ProjectSlots(width, height);
+        Equal(5, sink.Requests.Count);
+        for (var index = 0; index < slots.Count; index++)
+        {
+            var slot = slots[index];
+            var request = sink.Requests[index];
+            Equal($"shop-slot-{index + 1}", request.RegionId);
+            Equal(frame.Sequence, request.FrameSequence);
+            Equal(capturedAt, request.CapturedAtUtc);
+            Equal(slot.Width, request.Width);
+            Equal(slot.Height, request.Height);
+            Equal(slot.Width * 4, request.Stride);
+            Equal(request.Stride * request.Height, request.Pixels.Length);
+            Equal(RegionCorpusSourceKind.LiveCapture, request.SourceKind);
+
+            var sourceFirstPixel = slot.Y * stride + slot.X * 4;
+            var sourceLastPixel = (slot.Y + slot.Height - 1) * stride + (slot.X + slot.Width - 1) * 4;
+            var copiedLastPixel = (request.Height - 1) * request.Stride + (request.Width - 1) * 4;
+            True(
+                pixels.AsSpan(sourceFirstPixel, 4).SequenceEqual(request.Pixels.AsSpan(0, 4)),
+                $"Slot {index + 1} must copy its first BGRA pixel from the padded source frame.");
+            True(
+                pixels.AsSpan(sourceLastPixel, 4).SequenceEqual(request.Pixels.AsSpan(copiedLastPixel, 4)),
+                $"Slot {index + 1} must copy its last BGRA pixel from the padded source frame.");
+        }
+    }
+    finally
+    {
+        recorder.DisposeAsync().AsTask().GetAwaiter().GetResult();
+    }
 }
 
 static void CorpusRoundTripsInOrder()
@@ -1652,6 +1748,19 @@ sealed class SequencedCorpusSink(params RegionCorpusWriteResult[] results) : IRe
     {
         Requests.Add(request);
         return ValueTask.FromResult(_results.Dequeue());
+    }
+}
+
+sealed class CollectingCorpusSink : IRegionCorpusSink
+{
+    public List<RegionCorpusWriteRequest> Requests { get; } = [];
+
+    public ValueTask<RegionCorpusWriteResult> WriteAsync(
+        RegionCorpusWriteRequest request,
+        CancellationToken cancellationToken = default)
+    {
+        Requests.Add(request);
+        return ValueTask.FromResult(new RegionCorpusWriteResult("test", BlobCreated: true));
     }
 }
 
