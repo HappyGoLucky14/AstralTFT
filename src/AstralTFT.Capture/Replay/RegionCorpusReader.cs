@@ -37,6 +37,7 @@ public sealed class RegionCorpusReader
         if (!File.Exists(_observationsPath))
             yield break;
 
+        var finalRecordIsTerminated = IsFinalRecordTerminated();
         using var lineReader = new StreamReader(_observationsPath);
         var current = await lineReader.ReadLineAsync(cancellationToken).ConfigureAwait(false);
         while (current is not null)
@@ -56,7 +57,10 @@ public sealed class RegionCorpusReader
                 observation = JsonSerializer.Deserialize<RegionCorpusObservation>(current, JsonOptions)
                     ?? throw new InvalidDataException("Corpus observation is empty.");
             }
-            catch (JsonException exception) when (next is null && IsIncompleteFinalJson(current, exception))
+            catch (JsonException exception) when (
+                next is null &&
+                !finalRecordIsTerminated &&
+                IsIncompleteFinalJson(current, exception))
             {
                 IgnoredIncompleteTailCount++;
                 yield break;
@@ -188,6 +192,25 @@ public sealed class RegionCorpusReader
         exception.LineNumber is 0 &&
         exception.BytePositionInLine is long bytePosition &&
         bytePosition >= Encoding.UTF8.GetByteCount(line);
+
+    private bool IsFinalRecordTerminated()
+    {
+        EnsureExistingDirectoryIsSafe(_rootDirectory, "corpus root");
+        RejectReparsePointIfPresent(_observationsPath, "corpus observation log");
+        using var stream = new FileStream(
+            _observationsPath,
+            FileMode.Open,
+            FileAccess.Read,
+            FileShare.Read,
+            bufferSize: 1,
+            FileOptions.SequentialScan);
+        if (stream.Length == 0)
+            return false;
+
+        stream.Seek(-1, SeekOrigin.End);
+        var finalByte = stream.ReadByte();
+        return finalByte is '\r' or '\n';
+    }
 
     private static void EnsureExistingDirectoryIsSafe(string path, string description)
     {
